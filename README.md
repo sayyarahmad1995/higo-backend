@@ -1,36 +1,25 @@
 # HiGO Backend
 
-Go backend for **HiGO**, a mobility platform launching with ride-hailing.
+HiGO is a Go modular monolith backed by PostgreSQL. The first vertical slice implements native phone authentication for the Flutter app.
 
-## Status
+## Run locally
 
-New repository, fresh history. Backend implementation has not begun. The first vertical slice is native phone authentication, built against the existing Flutter client. Do not treat project documentation as evidence that features are implemented.
+1. Run `docker compose up -d --wait postgres` or provide a dedicated PostgreSQL database.
+2. Load the values from [.env.example](.env.example) into the process environment. Set `HIGO_OTP_KEY` to the Base64 encoding of 32 cryptographically random bytes. For example, in PowerShell run `$env:HIGO_OTP_KEY = [Convert]::ToBase64String([Security.Cryptography.RandomNumberGenerator]::GetBytes(32))`.
+3. Run `go run ./cmd/api`. Startup applies forward-only migrations. Development SMS codes appear on the local API console.
+4. On an Android emulator, run the Flutter app with `flutter run --dart-define=HIGO_API_URL=http://10.0.2.2:8080`. Release builds require an HTTPS API URL.
 
-## Source of truth
+## Tests
 
-Read these before implementing a slice:
+Run `go test ./...` and `go vet ./...`. For PostgreSQL-backed HTTP and concurrency tests, set `HIGO_TEST_DATABASE_URL` to a dedicated database and run `go test -count=1 -v ./...`. The test creates and drops its own schema. The test run reports a skip when the URL is absent.
 
-- [Architecture](docs/ARCHITECTURE.md): current technical rules and delivery boundaries.
-- [Product](docs/PRODUCT.md): ride-hailing scope and vertical-slice sequence.
-- [Authentication](docs/AUTHENTICATION.md): native phone-authentication contract.
-- [Decisions](docs/DECISIONS.md): accepted architectural decisions.
+To run the Flutter authentication smoke test, start the development API against an empty test database and redirect its standard error to a private local log. In the Flutter checkout run `flutter test test/auth_live_test.dart --dart-define=HIGO_API_URL=http://127.0.0.1:8080 --dart-define=HIGO_TEST_SMS_LOG=<absolute-log-path>`. The test uses a fixed test phone and waits for the shared SMS cooldown before testing recovery. It uses the real HTTP API and PostgreSQL with a test implementation of platform secure storage.
 
-Keep these documents short, consistent, and up to date. A deliberate change requires an explicit decision and corresponding implementation updates.
+Production uses Twilio credentials from the environment, TLS at the ingress, and a private backend listener. See the [authentication contract](docs/AUTHENTICATION.md) for API behavior and deployment requirements.
 
-## Repositories
+## Handbook
 
-- Active Flutter client: [uber-clone-mobile](https://github.com/sayyarahmad1995/uber-clone-mobile).
-- Historical Go backend reference: [uber-clone](https://github.com/sayyarahmad1995/uber-clone). Do not merge or copy its authentication architecture wholesale.
-
-## Implementation principles
-
-- Go modular monolith and PostgreSQL.
-- One end-to-end Flutter user journey per vertical slice.
-- Keep application-owned APIs as the only client authentication interface.
-- Reuse established security libraries, not homemade cryptographic primitives.
-- Implement required tests and security controls within the same slice.
-- No premature microservices, Redis dependency, or enterprise scaffolding.
-
-## Initial slice
-
-Registration, phone OTP verification, phone/password login, phone-only password recovery, refreshable sessions, logout and authorization middleware. Validate with the actual Flutter screens and real PostgreSQL integration tests before moving on.
+- [Architecture](docs/ARCHITECTURE.md)
+- [Authentication](docs/AUTHENTICATION.md)
+- [Decisions](docs/DECISIONS.md)
+- [Product](docs/PRODUCT.md)
