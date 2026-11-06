@@ -280,13 +280,13 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					decodeErr = invalid
 				}
 			}
-			if decodeErr != nil {
-				if documentUpload && time.Since(uploadStarted) >= 5*time.Second {
-					penaltyCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-					_, _ = s.db.Exec(penaltyCtx, `INSERT INTO auth_rate_limits(key,bucket,attempts,expires_at) VALUES ($1,0,1,now()+interval '60 seconds')
+			if documentUpload && time.Since(uploadStarted) >= 5*time.Second {
+				penaltyCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+				_, _ = s.db.Exec(penaltyCtx, `INSERT INTO auth_rate_limits(key,bucket,attempts,expires_at) VALUES ($1,0,1,now()+interval '60 seconds')
  ON CONFLICT (key,bucket) DO UPDATE SET expires_at=excluded.expires_at`, cooldownKey)
-					stop()
-				}
+				stop()
+			}
+			if decodeErr != nil {
 				if releaseUpload != nil {
 					releaseUpload()
 				}
