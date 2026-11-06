@@ -1,4 +1,5 @@
-CREATE TABLE driver_onboarding_applications (
+-- An earlier draft of this branch created the identical schema as version 7.
+CREATE TABLE IF NOT EXISTS driver_onboarding_applications (
     user_id bigint NOT NULL REFERENCES auth_users(id) ON DELETE CASCADE,
     application_version integer NOT NULL DEFAULT 1 CHECK (application_version > 0),
     draft_revision bigint NOT NULL DEFAULT 1 CHECK (draft_revision > 0),
@@ -17,7 +18,7 @@ CREATE TABLE driver_onboarding_applications (
     CHECK (submitted_at IS NULL OR (cnic_front IS NOT NULL AND registration_image IS NOT NULL))
 );
 
-CREATE UNIQUE INDEX driver_onboarding_one_draft ON driver_onboarding_applications (user_id)
+CREATE UNIQUE INDEX IF NOT EXISTS driver_onboarding_one_draft ON driver_onboarding_applications (user_id)
 WHERE submitted_at IS NULL;
-CREATE INDEX driver_onboarding_draft_expiry ON driver_onboarding_applications (updated_at)
+CREATE INDEX IF NOT EXISTS driver_onboarding_draft_expiry ON driver_onboarding_applications (updated_at)
 WHERE submitted_at IS NULL AND (cnic_front IS NOT NULL OR registration_image IS NOT NULL);

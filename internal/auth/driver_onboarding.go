@@ -66,7 +66,7 @@ func readOnboarding(ctx context.Context, tx pgx.Tx, id int64) (onboardingApplica
 		return result, err
 	}
 	if result.SubmittedAt != nil {
-		result.Status = "under_review"
+		result.Status = "pending_review"
 	}
 	result.Draft["revision"] = revision
 	if identity {

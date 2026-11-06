@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -267,7 +268,7 @@ func TestAuthenticationFlow(t *testing.T) {
 		for range 2 {
 			result := <-results
 			expect(t, result.status, 200, result.body)
-			if result.body["status"] != "under_review" || result.body["application_version"] != float64(1) || result.body["submitted_at"] == nil {
+			if result.body["status"] != "pending_review" || result.body["application_version"] != float64(1) || result.body["submitted_at"] == nil {
 				t.Fatal(result.body)
 			}
 		}
@@ -277,16 +278,55 @@ func TestAuthenticationFlow(t *testing.T) {
 		identity["draft_revision"] = "5"
 		status, body = call(http.MethodPost, identityPath, restored, identity)
 		expect(t, status, 409, body)
-		if result := get(restored); result["status"] != "under_review" || draftOf(result)["legal_name"] != "Example Driver" {
+		if result := get(restored); result["status"] != "pending_review" || draftOf(result)["legal_name"] != "Example Driver" {
 			t.Fatal(result)
 		}
-		var encrypted []byte
+		var encrypted [4][]byte
 		var applications int
 		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM driver_onboarding_applications`).Scan(&applications); err != nil || applications != 1 {
 			t.Fatalf("application count %d: %v", applications, err)
 		}
-		if err := isolated.QueryRow(ctx, `SELECT cnic_front FROM driver_onboarding_applications`).Scan(&encrypted); err != nil || len(encrypted) == 0 || bytes.HasPrefix(encrypted, picture.Bytes()[:8]) {
-			t.Fatalf("invalid encrypted image: %v", err)
+		var ownerID int64
+		if err := isolated.QueryRow(ctx, `SELECT user_id,cnic_front,cnic_back,registration_image,insurance_image FROM driver_onboarding_applications`).
+			Scan(&ownerID, &encrypted[0], &encrypted[1], &encrypted[2], &encrypted[3]); err != nil {
+			t.Fatal(err)
+		}
+		cipher, err := newDriverDocumentCipher(bytes.Repeat([]byte{8}, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, side := range []string{"identity:front", "identity:back", "vehicle:registration", "vehicle:insurance"} {
+			aad := []byte(fmt.Sprintf("driver-onboarding:%d:1:%s", ownerID, side))
+			plain, err := cipher.Open(nil, nil, encrypted[i], aad)
+			if err != nil || !bytes.HasPrefix(plain, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted[i], picture.Bytes()[:8]) {
+				t.Fatalf("invalid encrypted %s: %v", side, err)
+			}
+			if _, err := cipher.Open(nil, nil, encrypted[i], append(aad, '!')); err == nil {
+				t.Fatalf("%s decrypted against the wrong snapshot context", side)
+			}
+		}
+		// A database which ran the first replacement draft has this same table
+		// and an earlier migration marker. Applying migration 9 must keep it.
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_identity_submissions(user_id,version,legal_name,cnic_front,cnic_back)
+ VALUES($1,1,'Legacy Driver',$2,$3)`, ownerID, encrypted[0], encrypted[1]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_vehicle_submissions(user_id,vehicle_id,version,make,model,manufacture_year,color,registration_number,registration_image,insurance_image)
+ VALUES($1,1,1,'Legacy','Car',2020,'Black','LEG-123',$2,$3)`, ownerID, encrypted[2], encrypted[3]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `UPDATE schema_migrations SET version=7 WHERE version=9`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrations.Apply(ctx, isolated); err != nil {
+			t.Fatal(err)
+		}
+		var legacyIdentity, vehicleImage, snapshot []byte
+		if err := isolated.QueryRow(ctx, `SELECT i.cnic_front,v.registration_image,a.cnic_front
+ FROM driver_identity_submissions i JOIN driver_vehicle_submissions v USING (user_id)
+ JOIN driver_onboarding_applications a USING (user_id) WHERE i.user_id=$1`, ownerID).Scan(&legacyIdentity, &vehicleImage, &snapshot); err != nil ||
+			!bytes.Equal(legacyIdentity, encrypted[0]) || !bytes.Equal(vehicleImage, encrypted[2]) || !bytes.Equal(snapshot, encrypted[0]) {
+			t.Fatalf("upgrade changed stored evidence: %v", err)
 		}
 		status, body = call(http.MethodGet, "me", restored, nil)
 		expect(t, status, 200, body)
