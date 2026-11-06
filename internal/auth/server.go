@@ -26,6 +26,7 @@ var (
 	unauthorized    = errors.New("unauthorized")
 	limited         = errors.New("rate_limited")
 	busy            = errors.New("temporarily_unavailable")
+	uploadTimeout   = errors.New("upload_timeout")
 )
 
 type SMS interface {
@@ -114,6 +115,7 @@ func (s *Server) cleanup(ctx context.Context) {
 			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
 			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
 			purgeSupersededDriverDocuments,
+			purgeSupersededVehicleDocuments,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
@@ -134,16 +136,17 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone            string                `json:"phone"`
-	Password         string                `json:"password"`
-	Name             string                `json:"name"`
-	Email            string                `json:"email"`
-	Challenge        string                `json:"challenge"`
-	Code             string                `json:"code"`
-	Refresh          string                `json:"refresh_token"`
-	Recovery         string                `json:"recovery_token"`
-	Profile          profilePatch          `json:"-"`
-	DriverSubmission driverSubmissionInput `json:"-"`
+	Phone             string                 `json:"phone"`
+	Password          string                 `json:"password"`
+	Name              string                 `json:"name"`
+	Email             string                 `json:"email"`
+	Challenge         string                 `json:"challenge"`
+	Code              string                 `json:"code"`
+	Refresh           string                 `json:"refresh_token"`
+	Recovery          string                 `json:"recovery_token"`
+	Profile           profilePatch           `json:"-"`
+	DriverSubmission  driverSubmissionInput  `json:"-"`
+	VehicleSubmission vehicleSubmissionInput `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -165,6 +168,8 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "POST", "me/email/verify", s.verifyEmail)
 	s.route(mux, "GET", "me/driver-submission", s.driverSubmission)
 	s.route(mux, "POST", "me/driver-submission", s.submitDriverIdentity)
+	s.route(mux, "GET", "me/vehicles", s.vehicles)
+	s.route(mux, "POST", "me/vehicles", s.submitVehicle)
 	return mux
 }
 
@@ -172,14 +177,21 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 	mux.HandleFunc(method+" /api/v1/"+path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
-		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		vehicleUpload := method == http.MethodPost && path == "me/vehicles"
+		requestTimeout := 10 * time.Second
+		if vehicleUpload {
+			requestTimeout = 25 * time.Second
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 		defer cancel()
 		peer, _, err := net.SplitHostPort(r.RemoteAddr)
 		if err != nil {
 			peer = r.RemoteAddr
 		}
 		limit := 60
-		if path == "auth/register" || path == "auth/recovery/request" || path == "me/driver-submission" {
+		documentUpload := method == http.MethodPost && (path == "me/driver-submission" || path == "me/vehicles")
+		if path == "auth/register" || path == "auth/recovery/request" || documentUpload || path == "me/driver-submission" {
 			limit = 10
 		}
 		if err := allow(ctx, s.db, path+"/ip/"+peer, time.Minute, limit); err != nil {
@@ -194,17 +206,21 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			if method == http.MethodPatch {
 				target = &body.Profile
 			}
-			if path == "me/driver-submission" {
+			if documentUpload {
 				if _, _, err := s.me(ctx, input{}, bearer); err != nil {
 					respond(w, 0, nil, err)
 					return
 				}
 				maxBytes = 3 * 1024 * 1024
+				target = &body.DriverSubmission
+				if path == "me/vehicles" {
+					maxBytes = 6 * 1024 * 1024
+					target = &body.VehicleSubmission
+				}
 				if r.ContentLength > maxBytes {
 					respond(w, 0, nil, documentTooLarge)
 					return
 				}
-				target = &body.DriverSubmission
 				select {
 				case s.driverUploadSlots <- struct{}{}:
 					defer func() { <-s.driverUploadSlots }()
@@ -213,7 +229,11 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					return
 				}
 				// Limit how long a stalled client can hold an upload slot.
-				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Second))
+				readTimeout := 5 * time.Second
+				if vehicleUpload {
+					readTimeout = 20 * time.Second
+				}
+				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
 			}
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 			decoder.DisallowUnknownFields()
@@ -227,8 +247,13 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 				}
 			}
 			if decodeErr != nil {
+				var networkError net.Error
+				if documentUpload && errors.As(decodeErr, &networkError) && networkError.Timeout() {
+					respond(w, 0, nil, uploadTimeout)
+					return
+				}
 				var oversized *http.MaxBytesError
-				if errors.As(decodeErr, &oversized) && path == "me/driver-submission" {
+				if errors.As(decodeErr, &oversized) && documentUpload {
 					respond(w, 0, nil, documentTooLarge)
 					return
 				}
@@ -248,7 +273,7 @@ func outcome(err error) string {
 	switch err {
 	case nil:
 		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota, identityRequired, vehicleNotFound, uploadTimeout:
 		return err.Error()
 	default:
 		return "internal_error"
@@ -262,8 +287,12 @@ func respond(w http.ResponseWriter, status int, result any, err error) {
 			status = 400
 		case documentTooLarge:
 			status = 413
-		case documentQuota:
+		case documentQuota, identityRequired:
 			status = 409
+		case vehicleNotFound:
+			status = 404
+		case uploadTimeout:
+			status = 408
 		case denied, unauthorized:
 			status = 401
 		case limited:

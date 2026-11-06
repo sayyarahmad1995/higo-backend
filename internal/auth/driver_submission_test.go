@@ -29,7 +29,7 @@ func TestDriverImageLimits(t *testing.T) {
 			}
 		})
 	}
-	var output boundedDriverImage
+	output := boundedDriverImage{limit: maxDriverImage}
 	if _, err := output.Write(bytes.Repeat([]byte{1}, maxDriverImage)); err != nil {
 		t.Fatal(err)
 	}
