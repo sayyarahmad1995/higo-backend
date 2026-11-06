@@ -157,6 +157,77 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
+	t.Run("profile updates belong to the bearer and persist across sessions", func(t *testing.T) {
+		patch := func(bearer string, fields map[string]any) (int, map[string]any) {
+			return call(http.MethodPatch, "me", bearer, fields)
+		}
+		status, body := patch("", map[string]any{"name": "Other"})
+		expect(t, status, 401, body)
+		for _, invalid := range []map[string]any{
+			{}, {"name": "   "}, {"email": "not an email"}, {"name": "Other", "phone": "+923011234567"},
+			{"name": "Other", "id": 2}, {"capabilities": []string{"driver"}},
+		} {
+			status, body = patch(access, invalid)
+			expect(t, status, 400, body)
+		}
+		status, body = patch(access, map[string]any{"name": "  Updated Rider  ", "email": "rider@example.test"})
+		expect(t, status, 200, body)
+		if body["name"] != "Updated Rider" || body["email"] != "rider@example.test" || body["phone"] != phone {
+			t.Fatalf("unexpected profile: %v", body)
+		}
+		status, body = post("login", credentials)
+		expect(t, status, 200, body)
+		secondAccess := body["access_token"].(string)
+		status, body = call(http.MethodGet, "me", secondAccess, nil)
+		expect(t, status, 200, body)
+		if body["name"] != "Updated Rider" || body["email"] != "rider@example.test" {
+			t.Fatalf("profile not visible from new session: %v", body)
+		}
+		status, body = patch(secondAccess, map[string]any{"email": ""})
+		expect(t, status, 200, body)
+		if body["name"] != "Updated Rider" || body["email"] != "" {
+			t.Fatalf("clearing email changed other profile data: %v", body)
+		}
+		lock, err := isolated.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Rollback(ctx)
+		if _, err := lock.Exec(ctx, "SELECT id FROM auth_users WHERE phone=$1 FOR UPDATE", phone); err != nil {
+			t.Fatal(err)
+		}
+		var lockPID int32
+		if err := lock.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&lockPID); err != nil {
+			t.Fatal(err)
+		}
+		pending := make(chan response, 1)
+		go func() {
+			status, body := patch(secondAccess, map[string]any{"name": "Late write"})
+			pending <- response{status, body}
+		}()
+		wait, cancel := context.WithTimeout(ctx, 3*time.Second)
+		defer cancel()
+		for {
+			var blocked bool
+			if err := isolated.QueryRow(wait, `SELECT EXISTS (
+ SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, lockPID).Scan(&blocked); err != nil {
+				t.Fatal("profile update never waited for the account lock: ", err)
+			}
+			if blocked {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		status, body = call(http.MethodPost, "auth/logout", secondAccess, nil)
+		expect(t, status, 204, body)
+		if err := lock.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		late := <-pending
+		expect(t, late.status, 401, late.body)
+		status, body = patch(secondAccess, map[string]any{"name": "Other"})
+		expect(t, status, 401, body)
+	})
 	status, body = post("login", map[string]string{"phone": phone, "password": "an incorrect password"})
 	expect(t, status, 401, body)
 	if body["error"] != unknown["error"] {
@@ -196,6 +267,8 @@ func TestAuthenticationFlow(t *testing.T) {
 	expect(t, status, 200, body)
 	recovery := body["recovery_token"].(string)
 	status, body = call(http.MethodGet, "me", recovery, nil)
+	expect(t, status, 401, body)
+	status, body = call(http.MethodPatch, "me", recovery, map[string]string{"name": "Other"})
 	expect(t, status, 401, body)
 	status, body = post("recovery/reset", map[string]string{"recovery_token": recovery, "password": newPassword})
 	expect(t, status, 204, body)
@@ -250,6 +323,8 @@ func TestAuthenticationFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 401, body)
+		status, body = call(http.MethodPatch, "me", access, map[string]string{"name": "Other"})
 		expect(t, status, 401, body)
 		for range 10 {
 			status, body = post("login", map[string]string{"phone": "+923091234567", "password": oldPassword})
@@ -306,6 +381,15 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, status, 401, body)
 		status, body = post("register/verify", map[string]string{"challenge": challenge, "code": code})
 		expect(t, status, 201, body)
+		status, body = call(http.MethodPatch, "me", body["access_token"].(string), map[string]string{"name": "Second Rider"})
+		expect(t, status, 200, body)
+		if body["name"] != "Second Rider" || body["phone"] != number {
+			t.Fatalf("unexpected second account profile: %v", body)
+		}
+		var firstName string
+		if err := isolated.QueryRow(ctx, "SELECT name FROM auth_users WHERE phone=$1", phone).Scan(&firstName); err != nil || firstName != "Updated Rider" {
+			t.Fatalf("first account changed: %q (%v)", firstName, err)
+		}
 	})
 
 	t.Run("a stalled SMS does not delay another recipient", func(t *testing.T) {
