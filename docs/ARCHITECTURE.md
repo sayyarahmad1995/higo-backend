@@ -26,4 +26,12 @@ This document defines the current backend architecture. [PRODUCT.md](PRODUCT.md)
 
 Native authentication → account/capabilities → Driver onboarding/vehicles → Rider ride requests → Driver offers/bidding → trip lifecycle → cash settlement/receipts → relevant Admin Operations.
 
+## Administrative service boundary
+
+HiGO Core serves Rider and Driver APIs and owns PostgreSQL migrations, applicant draft and version writes, and the derived current application state. The separately deployed [HiGO Admin Operations service](https://github.com/sayyarahmad1995/higo-admin-operations) serves its own Go API and same-origin SPA. Core has no administrative HTTP surface.
+
+Admin authenticates designated reviewers through Core's ordinary account authentication and checks the database reviewer grant and active session on every privileged operation. A trusted operator provisions or revokes the grant. Admin uses a separate database identity with narrow read and insert privileges. It has no access to password hashes or unrestricted session data. The Core-owned reviewer lock function serializes administrative actions against applicant changes. PostgreSQL stores check decisions and document-access audit entries. Core derives application status from that state.
+
+Core encrypts uploaded evidence. Admin receives the same separately managed document key so it can decrypt authorized reads. Before production, validate key identifiers, rotation and backup recovery, expiry and restore behavior, reviewer provisioning and revocation, audit monitoring, and the isolated HTTPS deployment.
+
 Shared functionality is introduced by the first slice that needs it, not by speculative up-front architecture.

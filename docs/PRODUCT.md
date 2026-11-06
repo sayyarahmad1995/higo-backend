@@ -42,12 +42,10 @@ GET /api/v1/me/vehicles returns the latest metadata for each owned vehicle. POST
 
 Vehicle and identity uploads have separate bounded intake capacity. One request body per account can be read at a time within an API process. A body read that takes at least five seconds triggers a shared 60-second upload cooldown for that account. Verify upload buffering, slow-client protection, and timeouts at the production ingress before accepting documents.
 
-## Administrative onboarding review
+## Driver application
 
-The same-origin Admin Operations page at `/admin/` uses HiGO sign-in. A trusted database operator grants access by inserting the designated account's ID into `onboarding_reviewers (user_id)` and revokes it by deleting that row. Every review request checks both the session and the current grant. Reviewers cannot review their own submissions.
+Become a Driver opens Driver Details, Vehicle Details, Upload Documents, then Review & Submit. The signed-in account saves wizard progress through `PATCH /api/v1/me/driver-application` and resumes it through `GET`. Existing identity and vehicle upload routes save encrypted evidence. A successful upload alone never places evidence in the review queue.
 
-`GET /api/v1/admin/onboarding` lists up to 100 current pending versions. `POST /api/v1/admin/onboarding/document` accepts the exact target and document side, then decrypts one image. The database records reviewer, applicant, target version, document side, and access time before the API releases any bytes. The response forbids caching. The ordinary identity and vehicle APIs return metadata and never return document bytes.
+The final `POST /api/v1/me/driver-application` binds the latest owned identity and vehicle versions in one transaction. A retry with the same binding returns the existing application. The applicant sees a single status and any rejection reason. Both checks must pass for approval. A revision invalidates the prior current application, requires explicit resubmission, and starts both checks again. A version rejected for either check cannot be reused. These transitions leave membership and marketplace eligibility unchanged.
 
-`POST /api/v1/admin/onboarding/decision` approves or rejects the exact current pending version. A rejection requires a reason visible to the applicant in Flutter. The decision stores reviewer and time. A new submission requires a new review. Review decisions do not grant Driver membership or marketplace eligibility.
-
-Before production, validate reviewer provisioning and revocation, audit retention and monitoring, and HTTPS handling of document responses. Confirm that the 30-day active-table cleanup is reflected in backup expiry and that restoring a backup cannot silently restore access to expired documents.
+The separate Admin Operations service reviews applications. Core owns the PostgreSQL schema, applicant writes, encrypted evidence, and derived application status. It serves applicant metadata only. Admin Operations owns reviewer access, privileged document reads, review decisions, and document-access auditing. See the service boundary in [Architecture](ARCHITECTURE.md).

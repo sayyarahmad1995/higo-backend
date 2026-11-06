@@ -140,18 +140,19 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone             string                 `json:"phone"`
-	Password          string                 `json:"password"`
-	Name              string                 `json:"name"`
-	Email             string                 `json:"email"`
-	Challenge         string                 `json:"challenge"`
-	Code              string                 `json:"code"`
-	Refresh           string                 `json:"refresh_token"`
-	Recovery          string                 `json:"recovery_token"`
-	Profile           profilePatch           `json:"-"`
-	DriverSubmission  driverSubmissionInput  `json:"-"`
-	VehicleSubmission vehicleSubmissionInput `json:"-"`
-	Review            reviewInput            `json:"-"`
+	Phone                 string                 `json:"phone"`
+	Password              string                 `json:"password"`
+	Name                  string                 `json:"name"`
+	Email                 string                 `json:"email"`
+	Challenge             string                 `json:"challenge"`
+	Code                  string                 `json:"code"`
+	Refresh               string                 `json:"refresh_token"`
+	Recovery              string                 `json:"recovery_token"`
+	Profile               profilePatch           `json:"-"`
+	DriverSubmission      driverSubmissionInput  `json:"-"`
+	VehicleSubmission     vehicleSubmissionInput `json:"-"`
+	ApplicationDraft      map[string]string      `json:"-"`
+	ApplicationSubmission applicationSubmission  `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -159,7 +160,6 @@ type operation func(context.Context, input, string) (int, any, error)
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	mux.Handle("GET /admin/", adminPage())
 	s.route(mux, "POST", "auth/register", s.register)
 	s.route(mux, "POST", "auth/register/verify", s.verifyRegistration)
 	s.route(mux, "POST", "auth/login", s.login)
@@ -176,9 +176,9 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "POST", "me/driver-submission", s.submitDriverIdentity)
 	s.route(mux, "GET", "me/vehicles", s.vehicles)
 	s.route(mux, "POST", "me/vehicles", s.submitVehicle)
-	s.route(mux, "GET", "admin/onboarding", s.pendingReviews)
-	s.route(mux, "POST", "admin/onboarding/document", s.reviewDocument)
-	s.route(mux, "POST", "admin/onboarding/decision", s.decideReview)
+	s.route(mux, "GET", "me/driver-application", s.driverApplication)
+	s.route(mux, "PATCH", "me/driver-application", s.saveDriverApplicationDraft)
+	s.route(mux, "POST", "me/driver-application", s.submitDriverApplication)
 	return mux
 }
 
@@ -222,8 +222,11 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			if method == http.MethodPatch {
 				target = &body.Profile
 			}
-			if strings.HasPrefix(path, "admin/onboarding/") {
-				target = &body.Review
+			if path == "me/driver-application" {
+				target = &body.ApplicationSubmission
+				if method == http.MethodPatch {
+					target = &body.ApplicationDraft
+				}
 			}
 			if documentUpload {
 				_, account, err := s.me(ctx, input{}, bearer)
@@ -327,7 +330,7 @@ func outcome(err error) string {
 	switch err {
 	case nil:
 		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota, identityRequired, vehicleNotFound, uploadTimeout, reviewerRequired, staleReview, reviewDocumentUnavailable:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota, identityRequired, vehicleNotFound, uploadTimeout, staleApplication:
 		return err.Error()
 	default:
 		return "internal_error"
@@ -347,9 +350,7 @@ func respond(w http.ResponseWriter, status int, result any, err error) {
 			status = 404
 		case uploadTimeout:
 			status = 408
-		case reviewerRequired:
-			status = 403
-		case staleReview, reviewDocumentUnavailable:
+		case staleApplication:
 			status = 409
 		case denied, unauthorized:
 			status = 401
