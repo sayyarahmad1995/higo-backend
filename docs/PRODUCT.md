@@ -19,3 +19,11 @@ The active Flutter repository defines existing screens, user journeys, and prese
 Implement vertical slices: authentication; account/capabilities; Driver onboarding and vehicles; Rider booking; Driver offers; trips; settlement/receipts; necessary operational tooling.
 
 A slice is complete when Go APIs, PostgreSQL persistence, Flutter integration, and critical success/error/concurrency tests are verified together.
+
+## Driver identity submission
+
+An authenticated Rider can start onboarding from Become a Driver. An account with Driver membership can open the same flow from the Driver account. The form starts with the account name and asks for the legal name and front and back images of the CNIC. Vehicle documents belong to vehicle registration.
+
+GET /api/v1/me/driver-submission returns the account's latest identity submission metadata, or not_submitted. POST accepts legal_name, cnic_front, and cnic_back as JSON, with the images encoded as Base64. Each successful submission creates an immutable version with submitted status. Submission leaves Driver membership, approval, and marketplace eligibility separate. Future review decisions must identify the exact version reviewed.
+
+Uploads accept JPEG or PNG up to 1 MiB per side. The API bounds image dimensions, decodes and re-encodes the images to remove metadata, and encrypts the document bytes with AES-GCM before saving to PostgreSQL. The public API returns metadata only. Set HIGO_DRIVER_DOCUMENT_KEY to a separate Base64-encoded random 32-byte key to enable uploads. Keep the key outside PostgreSQL and protect its backup. Before production collection, validate key management, retention and deletion policy, access auditing, and the intended upload path through HTTPS ingress.

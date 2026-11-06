@@ -54,7 +54,7 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 	}
 	proof := tokenDigest(code, "em_")
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		owner, err := lockEmailAccount(ctx, tx, digest)
+		owner, err := lockSessionAccount(ctx, tx, digest)
 		if err != nil {
 			return err
 		}
@@ -100,7 +100,7 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 	}
 	var profile currentUser
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		owner, err := lockEmailAccount(ctx, tx, digest)
+		owner, err := lockSessionAccount(ctx, tx, digest)
 		if err != nil {
 			return err
 		}
@@ -120,7 +120,7 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 	return 202, profile, err
 }
 
-func lockEmailAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
+func lockSessionAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
 	var id int64
 	err := tx.QueryRow(ctx, `SELECT u.id FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
  WHERE s.access_digest=$1 FOR UPDATE OF u`, digest).Scan(&id)
@@ -149,7 +149,7 @@ func (s *Server) verifyEmail(ctx context.Context, body input, bearer string) (in
 	}
 	var profile currentUser
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		id, err := lockEmailAccount(ctx, tx, digest)
+		id, err := lockSessionAccount(ctx, tx, digest)
 		if err != nil {
 			return err
 		}
