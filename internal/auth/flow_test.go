@@ -213,6 +213,12 @@ func TestAuthenticationFlow(t *testing.T) {
 			}()
 		}
 		first, second := <-versions, <-versions
+		if first.status == 503 {
+			first.status, first.body = call(http.MethodPost, "me/driver-submission", access, payload)
+		}
+		if second.status == 503 {
+			second.status, second.body = call(http.MethodPost, "me/driver-submission", access, payload)
+		}
 		expect(t, first.status, 201, first.body)
 		expect(t, second.status, 201, second.body)
 		if first.body["version"] == second.body["version"] {
@@ -262,6 +268,70 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["email"] != "signup@example.test" || body["email_verified"] != false || body["pending_email"] != "" || len(emails) != 0 {
 		t.Fatal("registration must store email unverified without sending", body)
 	}
+	var vehicleID string
+	var vehiclePayload map[string]any
+	t.Run("vehicle submissions persist versions without granting approval", func(t *testing.T) {
+		var picture bytes.Buffer
+		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		payload := map[string]any{"make": "Toyota", "model": "Corolla", "color": "White", "manufacture_year": "2022", "registration_number": "ABC-123", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes()}
+		status, body := call(http.MethodPost, "me/vehicles", "", payload)
+		expect(t, status, 401, body)
+		payload["registration_image"] = make([]byte, maxVehicleDocument+1)
+		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		expect(t, status, 413, body)
+		payload["insurance_image"] = make([]byte, 3*maxVehicleDocument)
+		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		expect(t, status, 413, body)
+		payload["registration_image"] = picture.Bytes()
+		payload["insurance_image"] = picture.Bytes()
+		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		expect(t, status, 201, body)
+		if body["status"] != "submitted" || body["version"] != float64(1) || body["registration_image"] != nil {
+			t.Fatal(body)
+		}
+		vehicleID = strconv.FormatInt(int64(body["vehicle_id"].(float64)), 10)
+		payload["vehicle_id"] = vehicleID
+		payload["color"] = "Blue"
+		vehiclePayload = payload
+		versions := make(chan response, 2)
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPost, "me/vehicles", access, payload)
+				versions <- response{status, body}
+			}()
+		}
+		a, b := <-versions, <-versions
+		if a.status == 503 {
+			a.status, a.body = call(http.MethodPost, "me/vehicles", access, payload)
+		}
+		if b.status == 503 {
+			b.status, b.body = call(http.MethodPost, "me/vehicles", access, payload)
+		}
+		expect(t, a.status, 201, a.body)
+		expect(t, b.status, 201, b.body)
+		if a.body["version"] == b.body["version"] {
+			t.Fatal("concurrent revisions reused a version")
+		}
+		status, body = call(http.MethodGet, "me/vehicles", access, nil)
+		expect(t, status, 200, body)
+		latest := body["vehicles"].([]any)
+		if len(latest) != 1 || latest[0].(map[string]any)["version"] != float64(3) {
+			t.Fatal(body)
+		}
+		for range cap(server.vehicleUploadSlots) {
+			server.vehicleUploadSlots <- struct{}{}
+		}
+		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		blocked := response{status, body}
+		status, body = call(http.MethodPost, "me/driver-submission", access, map[string]any{"legal_name": "Driver"})
+		for range cap(server.vehicleUploadSlots) {
+			<-server.vehicleUploadSlots
+		}
+		expect(t, blocked.status, 503, blocked.body)
+		expect(t, status, 400, body)
+	})
 	t.Run("driver membership comes from storage across sessions", func(t *testing.T) {
 		status, body := call(http.MethodGet, "me", access, nil)
 		expect(t, status, 200, body)
@@ -397,11 +467,27 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = post("login", map[string]string{"phone": "+923081234567", "password": credentials["password"]})
 		expect(t, status, 200, body)
 		otherAccess := body["access_token"].(string)
+		status, body = call(http.MethodGet, "me/vehicles", otherAccess, nil)
+		expect(t, status, 200, body)
+		if vehicleID == "" || len(body["vehicles"].([]any)) != 0 {
+			t.Fatal("another account's vehicle was exposed", body)
+		}
 		status, body = call(http.MethodGet, "me/driver-submission", otherAccess, nil)
 		expect(t, status, 200, body)
 		if body["status"] != "not_submitted" {
 			t.Fatal("another account's submission was exposed", body)
 		}
+		status, body = call(http.MethodPost, "me/vehicles", otherAccess, vehiclePayload)
+		expect(t, status, 409, body)
+		if body["error"] != "driver_identity_required" {
+			t.Fatal(body)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_identity_submissions(user_id,version,legal_name)
+ SELECT id,1,'Other Driver' FROM auth_users WHERE phone='+923081234567'`); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodPost, "me/vehicles", otherAccess, vehiclePayload)
+		expect(t, status, 404, body)
 		status, body = verify(otherAccess, code)
 		expect(t, status, 400, body)
 		if _, err := isolated.Exec(ctx, `UPDATE auth_email_challenges SET expires_at=now()-interval '1 second' WHERE user_id=$1`, id); err != nil {

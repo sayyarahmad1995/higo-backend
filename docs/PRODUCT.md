@@ -33,3 +33,11 @@ The server caps the complete JSON body at 3 MiB, limits each original and normal
 Incomplete drafts stay on the device in memory. Cleanup removes the encrypted image bytes of superseded versions older than 30 days while keeping version metadata. Each account is capped at 20 versions with document bytes and 250 versions overall. Account deletion cascades to the stored submissions. Before collecting real CNICs, confirm retention and deletion obligations, including backups, and test physical-device picker cancellation and recovery. Establish key identifiers, rotation and recovery procedures, and a tested protected key backup before production. Slice 3C must provide separately authorized and audited reviewer access to documents.
 
 Future document endpoints must apply bounded request bodies, per-file byte and image limits, bounded processing, and cleanup. The initial ceiling is 2 MiB per driver's license or vehicle document image. PDFs require a separate format decision and a maximum of 5 MiB if introduced.
+
+## Vehicle registration
+
+After submitting identity, the account owner can register a vehicle from My Vehicles. The submission contains make, model, year, color, registration number, and JPEG or PNG images of the registration and insurance documents. Each image is capped at 2 MiB and the full JSON body at 6 MiB, with the same dimension, pixel, concurrency, validation, and encryption controls as identity documents.
+
+GET /api/v1/me/vehicles returns the latest metadata for each owned vehicle. POST creates a vehicle or appends a version when given an existing owned vehicle_id. Each version starts submitted and carries no approval or service eligibility. The endpoint returns metadata only. Per account, the limits are 10 vehicles, 20 versions retaining document bytes, and 250 total versions. Cleanup removes images from superseded versions older than 30 days while retaining version metadata.
+
+Vehicle and identity uploads have separate bounded intake capacity. One request body per account can be read at a time within an API process. A body read that takes at least five seconds triggers a shared 60-second upload cooldown for that account. Verify upload buffering, slow-client protection, and timeouts at the production ingress before accepting documents.

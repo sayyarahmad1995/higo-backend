@@ -30,10 +30,13 @@ var (
 	documentQuota    = errors.New("document_quota_exceeded")
 )
 
-type boundedDriverImage struct{ bytes.Buffer }
+type boundedDriverImage struct {
+	bytes.Buffer
+	limit int
+}
 
 func (b *boundedDriverImage) Write(data []byte) (int, error) {
-	if len(data) > maxDriverImage-b.Len() {
+	if len(data) > b.limit-b.Len() {
 		return 0, documentTooLarge
 	}
 	return b.Buffer.Write(data)
@@ -67,7 +70,11 @@ func newDriverDocumentCipher(key []byte) (cipher.AEAD, error) {
 }
 
 func normalizeDriverImage(data []byte) ([]byte, error) {
-	if len(data) > maxDriverImage {
+	return normalizeDocumentImage(data, maxDriverImage)
+}
+
+func normalizeDocumentImage(data []byte, limit int) ([]byte, error) {
+	if len(data) > limit {
 		return nil, documentTooLarge
 	}
 	if len(data) == 0 {
@@ -81,7 +88,7 @@ func normalizeDriverImage(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, invalidDocument
 	}
-	var output boundedDriverImage
+	output := boundedDriverImage{limit: limit}
 	if format == "jpeg" {
 		err = jpeg.Encode(&output, decoded, nil)
 	} else {
