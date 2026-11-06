@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -25,8 +26,11 @@ type testSMS struct {
 
 type testEmail chan string
 
-func (s testEmail) Send(_ context.Context, _, code string) error {
+func (s testEmail) Send(_ context.Context, address, code string) error {
 	s <- code
+	if address == "failed@example.test" {
+		return errors.New("test provider unavailable")
+	}
 	return nil
 }
 
@@ -328,6 +332,16 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, status, 200, body)
 		if body["email"] != "next@example.test" || body["pending_email"] != "" || body["email_verified"] != true {
 			t.Fatal("replacement not applied", body)
+		}
+		resetCooldown()
+		status, body = request("failed@example.test", credentials["password"])
+		expect(t, status, 503, body)
+		status, body = verify(access, <-emails)
+		expect(t, status, 400, body)
+		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if body["email"] != "next@example.test" || body["pending_email"] != "" || body["email_verified"] != true {
+			t.Fatal("failed delivery changed the trusted address or exposed a pending address", body)
 		}
 	})
 	status, body = post("login", map[string]string{"phone": phone, "password": "an incorrect password"})
