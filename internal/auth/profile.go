@@ -66,7 +66,7 @@ func (s *Server) updateProfile(ctx context.Context, body input, bearer string) (
 		result, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET name=COALESCE($3,u.name),email=COALESCE($4,u.email)
  WHERE u.id=$2 AND EXISTS (SELECT 1 FROM auth_sessions s WHERE s.user_id=u.id AND s.access_digest=$1
  AND s.revoked_at IS NULL AND s.access_expires_at>clock_timestamp() AND s.expires_at>clock_timestamp() FOR SHARE OF s)
- RETURNING u.id,u.phone,u.name,u.email`, digest, userID, patch.Name, patch.Email))
+ RETURNING u.id,u.phone,u.name,u.email,u.has_driver_capability`, digest, userID, patch.Name, patch.Email))
 		return err
 	})
 	return 200, result, err

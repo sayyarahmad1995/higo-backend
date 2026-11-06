@@ -159,7 +159,7 @@ func (s *Server) me(ctx context.Context, _ input, bearer string) (int, any, erro
 	if digest == nil {
 		return 0, nil, unauthorized
 	}
-	user, err := scanCurrentUser(s.db.QueryRow(ctx, `SELECT u.id,u.phone,u.name,u.email FROM auth_sessions s
+	user, err := scanCurrentUser(s.db.QueryRow(ctx, `SELECT u.id,u.phone,u.name,u.email,u.has_driver_capability FROM auth_sessions s
  JOIN auth_users u ON u.id=s.user_id WHERE s.access_digest=$1 AND s.revoked_at IS NULL
  AND s.access_expires_at>now() AND s.expires_at>now()`, digest))
 	return 200, user, err
@@ -167,7 +167,11 @@ func (s *Server) me(ctx context.Context, _ input, bearer string) (int, any, erro
 
 func scanCurrentUser(row pgx.Row) (currentUser, error) {
 	user := currentUser{Capabilities: []string{"rider"}}
-	err := row.Scan(&user.ID, &user.Phone, &user.Name, &user.Email)
+	var driver bool
+	err := row.Scan(&user.ID, &user.Phone, &user.Name, &user.Email, &driver)
+	if driver {
+		user.Capabilities = append(user.Capabilities, "driver")
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return currentUser{}, unauthorized
 	}

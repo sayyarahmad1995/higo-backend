@@ -157,6 +157,23 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
+	t.Run("driver membership comes from storage across sessions", func(t *testing.T) {
+		status, body := call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if got := body["capabilities"].([]any); len(got) != 1 || got[0] != "rider" {
+			t.Fatalf("default capabilities = %v", got)
+		}
+		if _, err := isolated.Exec(ctx, "UPDATE auth_users SET has_driver_capability=true WHERE phone=$1", phone); err != nil {
+			t.Fatal(err)
+		}
+		status, body = post("login", credentials)
+		expect(t, status, 200, body)
+		status, body = call(http.MethodGet, "me", body["access_token"].(string), nil)
+		expect(t, status, 200, body)
+		if got := body["capabilities"].([]any); len(got) != 2 || got[0] != "rider" || got[1] != "driver" {
+			t.Fatalf("persisted capabilities = %v", got)
+		}
+	})
 	t.Run("profile updates belong to the bearer and persist across sessions", func(t *testing.T) {
 		patch := func(bearer string, fields map[string]any) (int, map[string]any) {
 			return call(http.MethodPatch, "me", bearer, fields)
