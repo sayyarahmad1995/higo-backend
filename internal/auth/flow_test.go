@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -172,166 +173,168 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
-	t.Run("driver identity submissions are authenticated and versioned", func(t *testing.T) {
-		var imageBytes bytes.Buffer
-		if err := png.Encode(&imageBytes, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
-			t.Fatal(err)
+	t.Run("unified onboarding is resumable, bounded and immutable on submission", func(t *testing.T) {
+		const path = "me/driver-application"
+		identityPath, vehiclePath := path+"/identity-documents", path+"/vehicle-documents"
+		get := func(token string) map[string]any {
+			t.Helper()
+			status, body := call(http.MethodGet, path, token, nil)
+			expect(t, status, 200, body)
+			return body
 		}
-		payload := map[string]any{"legal_name": "Example Driver", "cnic_front": imageBytes.Bytes(), "cnic_back": imageBytes.Bytes()}
-		status, body := call(http.MethodPost, "me/driver-submission", "", payload)
+		draftOf := func(body map[string]any) map[string]any { return body["draft"].(map[string]any) }
+		status, body := call(http.MethodGet, path, "", nil)
 		expect(t, status, 401, body)
-		status, body = call(http.MethodGet, "me/driver-submission", access, nil)
+		if draftOf(get(access))["revision"] != "0" {
+			t.Fatal("unexpected draft")
+		}
+		fields := map[string]string{"step": "1", "revision": "0"}
+		status, body = call(http.MethodPatch, path, access, fields)
+		expect(t, status, 409, body)
+		fields["legal_name"] = "Example Driver"
+		status, body = call(http.MethodPatch, path, access, fields)
 		expect(t, status, 200, body)
-		if body["status"] != "not_submitted" {
-			t.Fatal(body)
-		}
-		payload["cnic_back"] = []byte("not an image")
-		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
-		expect(t, status, 400, body)
-		payload["cnic_back"] = imageBytes.Bytes()
-		payload["approved"] = true
-		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
-		expect(t, status, 400, body)
-		delete(payload, "approved")
-		for version := 1; version <= 2; version++ {
-			status, body = call(http.MethodPost, "me/driver-submission", access, payload)
-			expect(t, status, 201, body)
-			if body["status"] != "submitted" || body["version"] != float64(version) || body["cnic_front"] != nil {
-				t.Fatal(body)
-			}
-		}
-		status, body = call(http.MethodGet, "me/driver-submission", access, nil)
-		expect(t, status, 200, body)
-		if body["version"] != float64(2) {
-			t.Fatal(body)
-		}
-		versions := make(chan response, 2)
+		fields["revision"] = "1"
+		fields["step"] = "2"
+		status, body = call(http.MethodPatch, path, access, fields)
+		expect(t, status, 409, body)
+		fields["make"], fields["model"], fields["manufacture_year"], fields["color"], fields["registration_number"] = "Test", "Car", "2020", "Black", "abc-123"
+		results := make(chan response, 2)
 		for range 2 {
 			go func() {
-				status, body := call(http.MethodPost, "me/driver-submission", access, payload)
-				versions <- response{status, body}
+				status, body := call(http.MethodPatch, path, access, fields)
+				results <- response{status, body}
 			}()
 		}
-		first, second := <-versions, <-versions
-		if first.status == 503 {
-			first.status, first.body = call(http.MethodPost, "me/driver-submission", access, payload)
+		a, b := <-results, <-results
+		if !((a.status == 200 && b.status == 409) || (a.status == 409 && b.status == 200)) {
+			t.Fatalf("draft race %v %v", a, b)
 		}
-		if second.status == 503 {
-			second.status, second.body = call(http.MethodPost, "me/driver-submission", access, payload)
-		}
-		expect(t, first.status, 201, first.body)
-		expect(t, second.status, 201, second.body)
-		if first.body["version"] == second.body["version"] {
-			t.Fatal("concurrent submissions reused a version")
-		}
-		var encrypted []byte
-		if err := isolated.QueryRow(ctx, `SELECT d.cnic_front FROM driver_identity_submissions d JOIN auth_users u ON u.id=d.user_id WHERE u.phone=$1 AND d.version=1`, phone).Scan(&encrypted); err != nil {
-			t.Fatal(err)
-		}
-		if bytes.HasPrefix(encrypted, imageBytes.Bytes()[:8]) {
-			t.Fatal("document stored as plaintext")
-		}
-		status, body = call(http.MethodGet, "me", access, nil)
-		expect(t, status, 200, body)
-		if capabilities := body["capabilities"].([]any); len(capabilities) != 1 || capabilities[0] != "rider" {
-			t.Fatal("submission changed membership", body)
-		}
-		previousPeer := peer
-		peer = "192.0.2.99:12345"
-		defer func() { peer = previousPeer }()
-		payload["cnic_front"] = make([]byte, maxDriverImage+1)
-		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
-		expect(t, status, 413, body)
-		if body["error"] != "document_too_large" {
-			t.Fatal(body)
-		}
-		if _, err := isolated.Exec(ctx, `UPDATE driver_identity_submissions SET submitted_at=now()-interval '31 days'`); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := isolated.Exec(ctx, purgeSupersededDriverDocuments); err != nil {
-			t.Fatal(err)
-		}
-		var versionsLeft, imagesLeft int
-		if err := isolated.QueryRow(ctx, `SELECT count(*),count(cnic_front) FROM driver_identity_submissions`).Scan(&versionsLeft, &imagesLeft); err != nil {
-			t.Fatal(err)
-		}
-		if versionsLeft != 4 || imagesLeft != 1 {
-			t.Fatalf("cleanup kept %d versions and %d document pairs", versionsLeft, imagesLeft)
-		}
-		payload["cnic_back"] = make([]byte, 2*maxDriverImage)
-		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
-		expect(t, status, 413, body)
-		if body["error"] != "document_too_large" {
-			t.Fatal(body)
-		}
-	})
-	if body["email"] != "signup@example.test" || body["email_verified"] != false || body["pending_email"] != "" || len(emails) != 0 {
-		t.Fatal("registration must store email unverified without sending", body)
-	}
-	var vehicleID string
-	var vehiclePayload map[string]any
-	t.Run("vehicle submissions persist versions without granting approval", func(t *testing.T) {
 		var picture bytes.Buffer
 		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
 			t.Fatal(err)
 		}
-		payload := map[string]any{"make": "Toyota", "model": "Corolla", "color": "White", "manufacture_year": "2022", "registration_number": "ABC-123", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes()}
-		status, body := call(http.MethodPost, "me/vehicles", "", payload)
+		identity := map[string]any{"draft_revision": "2", "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes()}
+		status, body = call(http.MethodPost, identityPath, "", identity)
 		expect(t, status, 401, body)
-		payload["registration_image"] = make([]byte, maxVehicleDocument+1)
-		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		identity["cnic_front"] = []byte("bad image")
+		status, body = call(http.MethodPost, identityPath, access, identity)
+		expect(t, status, 400, body)
+		identity["cnic_front"] = make([]byte, maxDriverImage+1)
+		status, body = call(http.MethodPost, identityPath, access, identity)
 		expect(t, status, 413, body)
-		payload["insurance_image"] = make([]byte, 3*maxVehicleDocument)
-		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		identity["cnic_back"] = make([]byte, 2*maxDriverImage)
+		status, body = call(http.MethodPost, identityPath, access, identity)
 		expect(t, status, 413, body)
-		payload["registration_image"] = picture.Bytes()
-		payload["insurance_image"] = picture.Bytes()
-		status, body = call(http.MethodPost, "me/vehicles", access, payload)
-		expect(t, status, 201, body)
-		if body["status"] != "submitted" || body["version"] != float64(1) || body["registration_image"] != nil {
-			t.Fatal(body)
-		}
-		vehicleID = strconv.FormatInt(int64(body["vehicle_id"].(float64)), 10)
-		payload["vehicle_id"] = vehicleID
-		payload["color"] = "Blue"
-		vehiclePayload = payload
-		versions := make(chan response, 2)
-		for range 2 {
-			go func() {
-				status, body := call(http.MethodPost, "me/vehicles", access, payload)
-				versions <- response{status, body}
-			}()
-		}
-		a, b := <-versions, <-versions
-		if a.status == 503 {
-			a.status, a.body = call(http.MethodPost, "me/vehicles", access, payload)
-		}
-		if b.status == 503 {
-			b.status, b.body = call(http.MethodPost, "me/vehicles", access, payload)
-		}
-		expect(t, a.status, 201, a.body)
-		expect(t, b.status, 201, b.body)
-		if a.body["version"] == b.body["version"] {
-			t.Fatal("concurrent revisions reused a version")
-		}
-		status, body = call(http.MethodGet, "me/vehicles", access, nil)
+		identity["cnic_front"], identity["cnic_back"] = picture.Bytes(), picture.Bytes()
+		status, body = call(http.MethodPost, identityPath, access, identity)
 		expect(t, status, 200, body)
-		latest := body["vehicles"].([]any)
-		if len(latest) != 1 || latest[0].(map[string]any)["version"] != float64(3) {
+		if draft := draftOf(body); draft["identity_saved"] != "true" || draft["revision"] != "3" {
 			t.Fatal(body)
 		}
+		status, body = call(http.MethodPost, path, access, map[string]string{"draft_revision": "3"})
+		expect(t, status, 409, body)
+		status, body = post("login", credentials)
+		expect(t, status, 200, body)
+		restored := body["access_token"].(string)
+		if draft := draftOf(get(restored)); draft["identity_saved"] != "true" || draft["registration_number"] != "ABC-123" {
+			t.Fatal(draft)
+		}
+		vehicle := map[string]any{"draft_revision": "3", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes()}
 		for range cap(server.vehicleUploadSlots) {
 			server.vehicleUploadSlots <- struct{}{}
 		}
-		status, body = call(http.MethodPost, "me/vehicles", access, payload)
-		blocked := response{status, body}
-		status, body = call(http.MethodPost, "me/driver-submission", access, map[string]any{"legal_name": "Driver"})
+		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
 		for range cap(server.vehicleUploadSlots) {
 			<-server.vehicleUploadSlots
 		}
-		expect(t, blocked.status, 503, blocked.body)
-		expect(t, status, 400, body)
+		expect(t, status, 503, body)
+		vehicle["insurance_image"] = make([]byte, maxVehicleDocument+1)
+		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
+		expect(t, status, 413, body)
+		vehicle["insurance_image"] = picture.Bytes()
+		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
+		expect(t, status, 200, body)
+		fields["step"], fields["revision"], fields["registration_number"] = "3", "4", "ABC-123"
+		status, body = call(http.MethodPatch, path, restored, fields)
+		expect(t, status, 200, body)
+		final := map[string]string{"draft_revision": "5"}
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPost, path, restored, final)
+				results <- response{status, body}
+			}()
+		}
+		for range 2 {
+			result := <-results
+			expect(t, result.status, 200, result.body)
+			if result.body["status"] != "pending_review" || result.body["application_version"] != float64(1) || result.body["submitted_at"] == nil {
+				t.Fatal(result.body)
+			}
+		}
+		fields["revision"], fields["legal_name"] = "5", "Attempted Rewrite"
+		status, body = call(http.MethodPatch, path, restored, fields)
+		expect(t, status, 409, body)
+		identity["draft_revision"] = "5"
+		status, body = call(http.MethodPost, identityPath, restored, identity)
+		expect(t, status, 409, body)
+		if result := get(restored); result["status"] != "pending_review" || draftOf(result)["legal_name"] != "Example Driver" {
+			t.Fatal(result)
+		}
+		var encrypted [4][]byte
+		var applications int
+		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM driver_onboarding_applications`).Scan(&applications); err != nil || applications != 1 {
+			t.Fatalf("application count %d: %v", applications, err)
+		}
+		var ownerID int64
+		if err := isolated.QueryRow(ctx, `SELECT user_id,cnic_front,cnic_back,registration_image,insurance_image FROM driver_onboarding_applications`).
+			Scan(&ownerID, &encrypted[0], &encrypted[1], &encrypted[2], &encrypted[3]); err != nil {
+			t.Fatal(err)
+		}
+		cipher, err := newDriverDocumentCipher(bytes.Repeat([]byte{8}, 32))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i, side := range []string{"identity:front", "identity:back", "vehicle:registration", "vehicle:insurance"} {
+			aad := []byte(fmt.Sprintf("driver-onboarding:%d:1:%s", ownerID, side))
+			plain, err := cipher.Open(nil, nil, encrypted[i], aad)
+			if err != nil || !bytes.HasPrefix(plain, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted[i], picture.Bytes()[:8]) {
+				t.Fatalf("invalid encrypted %s: %v", side, err)
+			}
+			if _, err := cipher.Open(nil, nil, encrypted[i], append(aad, '!')); err == nil {
+				t.Fatalf("%s decrypted against the wrong snapshot context", side)
+			}
+		}
+		// A database which ran the first replacement draft has this same table
+		// and an earlier migration marker. Applying migration 9 must keep it.
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_identity_submissions(user_id,version,legal_name,cnic_front,cnic_back)
+ VALUES($1,1,'Legacy Driver',$2,$3)`, ownerID, encrypted[0], encrypted[1]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_vehicle_submissions(user_id,vehicle_id,version,make,model,manufacture_year,color,registration_number,registration_image,insurance_image)
+ VALUES($1,1,1,'Legacy','Car',2020,'Black','LEG-123',$2,$3)`, ownerID, encrypted[2], encrypted[3]); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `UPDATE schema_migrations SET version=7 WHERE version=9`); err != nil {
+			t.Fatal(err)
+		}
+		if err := migrations.Apply(ctx, isolated); err != nil {
+			t.Fatal(err)
+		}
+		var legacyIdentity, vehicleImage, snapshot []byte
+		if err := isolated.QueryRow(ctx, `SELECT i.cnic_front,v.registration_image,a.cnic_front
+ FROM driver_identity_submissions i JOIN driver_vehicle_submissions v USING (user_id)
+ JOIN driver_onboarding_applications a USING (user_id) WHERE i.user_id=$1`, ownerID).Scan(&legacyIdentity, &vehicleImage, &snapshot); err != nil ||
+			!bytes.Equal(legacyIdentity, encrypted[0]) || !bytes.Equal(vehicleImage, encrypted[2]) || !bytes.Equal(snapshot, encrypted[0]) {
+			t.Fatalf("upgrade changed stored evidence: %v", err)
+		}
+		status, body = call(http.MethodGet, "me", restored, nil)
+		expect(t, status, 200, body)
+		if caps := body["capabilities"].([]any); len(caps) != 1 || caps[0] != "rider" {
+			t.Fatal(body)
+		}
 	})
+
 	t.Run("driver membership comes from storage across sessions", func(t *testing.T) {
 		status, body := call(http.MethodGet, "me", access, nil)
 		expect(t, status, 200, body)
@@ -467,27 +470,26 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = post("login", map[string]string{"phone": "+923081234567", "password": credentials["password"]})
 		expect(t, status, 200, body)
 		otherAccess := body["access_token"].(string)
-		status, body = call(http.MethodGet, "me/vehicles", otherAccess, nil)
+		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
 		expect(t, status, 200, body)
-		if vehicleID == "" || len(body["vehicles"].([]any)) != 0 {
-			t.Fatal("another account's vehicle was exposed", body)
+		if body["status"] != "draft" || body["draft"].(map[string]any)["revision"] != "0" {
+			t.Fatal("another account's application was exposed", body)
 		}
-		status, body = call(http.MethodGet, "me/driver-submission", otherAccess, nil)
-		expect(t, status, 200, body)
-		if body["status"] != "not_submitted" {
-			t.Fatal("another account's submission was exposed", body)
-		}
-		status, body = call(http.MethodPost, "me/vehicles", otherAccess, vehiclePayload)
+		status, body = call(http.MethodPost, "me/driver-application", otherAccess, map[string]string{"draft_revision": "5"})
 		expect(t, status, 409, body)
-		if body["error"] != "driver_identity_required" {
-			t.Fatal(body)
-		}
-		if _, err := isolated.Exec(ctx, `INSERT INTO driver_identity_submissions(user_id,version,legal_name)
- SELECT id,1,'Other Driver' FROM auth_users WHERE phone='+923081234567'`); err != nil {
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_onboarding_applications(user_id,details,cnic_front,cnic_back,updated_at)
+ SELECT id,'{"step":"2","legal_name":"Other Applicant"}',decode('01','hex'),decode('01','hex'),now()-interval '31 days'
+ FROM auth_users WHERE phone='+923081234567'`); err != nil {
 			t.Fatal(err)
 		}
-		status, body = call(http.MethodPost, "me/vehicles", otherAccess, vehiclePayload)
-		expect(t, status, 404, body)
+		if _, err := isolated.Exec(ctx, purgeAbandonedOnboardingDocuments); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
+		expect(t, status, 200, body)
+		if draft := body["draft"].(map[string]any); draft["identity_saved"] != nil || draft["legal_name"] != "Other Applicant" || draft["revision"] != "2" {
+			t.Fatal("cleanup failed to expire evidence without deleting draft details", body)
+		}
 		status, body = verify(otherAccess, code)
 		expect(t, status, 400, body)
 		if _, err := isolated.Exec(ctx, `UPDATE auth_email_challenges SET expires_at=now()-interval '1 second' WHERE user_id=$1`, id); err != nil {
@@ -721,4 +723,18 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = post("recovery/request", phone)
 		expect(t, status, 202, body)
 	})
+}
+
+func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
+	handler := (&Server{}).Handler()
+	for _, path := range []string{"/admin/", "/admin/app.mjs", "/api/v1/admin/onboarding", "/api/v1/admin/onboarding/document",
+		"/api/v1/admin/onboarding/decision", "/api/v1/admin/auth/login", "/api/v1/admin/audit", "/api/v1/me/driver-submission", "/api/v1/me/vehicles"} {
+		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch} {
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, httptest.NewRequest(method, path, nil))
+			if recorder.Code != 404 {
+				t.Errorf("%s %s: %d", method, path, recorder.Code)
+			}
+		}
+	}
 }
