@@ -175,6 +175,7 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "PATCH", onboardingPath, s.saveOnboarding)
 	s.route(mux, "POST", onboardingPath, s.submitOnboarding)
 	s.route(mux, "POST", onboardingPath+"/document", s.saveOnboardingDocument)
+	s.route(mux, "DELETE", onboardingPath+"/document", s.removeOnboardingDocument)
 	s.route(mux, "GET", onboardingPath+"/preview", s.previewOnboardingDocument)
 	return mux
 }
@@ -208,8 +209,13 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			return
 		}
 		var body input
+		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if path == onboardingPath+"/preview" {
 			body.OnboardingPreview = r.URL.Query().Get("kind")
+			if _, _, err := s.me(ctx, input{}, bearer); err != nil {
+				respond(w, 0, nil, err)
+				return
+			}
 			select {
 			case s.driverDocumentSlots <- struct{}{}:
 				defer func() { <-s.driverDocumentSlots }()
@@ -218,7 +224,10 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 				return
 			}
 		}
-		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if method == http.MethodDelete && path == onboardingPath+"/document" {
+			body.OnboardingDocument.Kind = r.URL.Query().Get("kind")
+			body.OnboardingDocument.Revision = r.URL.Query().Get("draft_revision")
+		}
 		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
 			var maxBytes int64 = 4096
 			var releaseUpload func()

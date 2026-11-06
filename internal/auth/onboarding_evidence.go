@@ -30,6 +30,26 @@ func completeDriver(d map[string]string, today time.Time) bool {
 
 func hasDocument(kinds []string, kind string) bool { return slices.Contains(kinds, kind) }
 
+func staleOnboardingEvidence(previous, current map[string]string) []string {
+	changed := func(fields ...string) bool {
+		for _, field := range fields {
+			if previous[field] != "" && previous[field] != current[field] {
+				return true
+			}
+		}
+		return false
+	}
+	var stale []string
+	if changed("legal_name", "date_of_birth", "cnic_number") {
+		stale = append(stale, "cnic_front", "cnic_back", "license_front", "license_back")
+	}
+	if changed("make", "model", "manufacture_year", "color", "registration_number") {
+		stale = append(stale, "registration", "additional", "exterior_front", "exterior_rear",
+			"exterior_right", "exterior_left", "interior_front", "interior_rear")
+	}
+	return stale
+}
+
 func unexpired(value string, today time.Time) bool {
 	expiry, err := time.Parse(time.DateOnly, value)
 	return err == nil && !expiry.Before(today)
@@ -139,4 +159,27 @@ func (s *Server) previewOnboardingDocument(ctx context.Context, body input, bear
 		return err
 	})
 	return 200, map[string][]byte{"image": plain}, err
+}
+
+func (s *Server) removeOnboardingDocument(ctx context.Context, body input, bearer string) (int, any, error) {
+	doc := body.OnboardingDocument
+	if doc.Kind != "additional" {
+		return 0, nil, invalid
+	}
+	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+		if current.SubmittedAt != nil || current.Draft["revision"] != doc.Revision {
+			return onboardingConflict
+		}
+		if !hasDocument(current.Documents, doc.Kind) {
+			return nil
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM driver_onboarding_documents
+ WHERE user_id=$1 AND application_version=$2 AND kind='additional'`, id, current.Version); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx, `UPDATE driver_onboarding_applications SET
+ details=details-'additional_expiry'-'additional_validity',draft_revision=draft_revision+1,updated_at=clock_timestamp()
+ WHERE user_id=$1 AND application_version=$2`, id, current.Version)
+		return err
+	})
 }

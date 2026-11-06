@@ -225,6 +225,8 @@ func TestAuthenticationFlow(t *testing.T) {
 		for _, kind := range requiredOnboardingDocuments[1:] {
 			apply(upload(kind, picture.Bytes(), 200))
 		}
+		apply(upload("additional", picture.Bytes(), 200))
+		apply(update(http.MethodDelete, path+"/document?kind=additional&draft_revision="+draft["revision"], nil, 200))
 		draft["step"], draft["cnic_validity"], draft["registration_validity"], draft["license_expiry"] = "3", "lifetime", "no_expiry", "2000-01-01"
 		update(http.MethodPatch, path, draft, 409)
 		draft["license_expiry"] = "2099-01-01"

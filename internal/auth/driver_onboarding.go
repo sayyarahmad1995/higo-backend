@@ -148,12 +148,19 @@ func (s *Server) saveOnboarding(ctx context.Context, body input, bearer string) 
 			return onboardingIncomplete
 		}
 		details["step"] = strconv.Itoa(step)
-		if step == 3 && !completeEvidence(details, current.Documents, onboardingToday()) {
+		stale := staleOnboardingEvidence(current.Draft, details)
+		if step == 3 && (len(stale) != 0 || !completeEvidence(details, current.Documents, onboardingToday())) {
 			return onboardingIncomplete
 		}
 		if current.Version == 0 {
 			_, err = tx.Exec(ctx, `INSERT INTO driver_onboarding_applications(user_id,details) VALUES($1,$2)`, id, details)
 			return err
+		}
+		if len(stale) != 0 {
+			if _, err := tx.Exec(ctx, `DELETE FROM driver_onboarding_documents
+ WHERE user_id=$1 AND application_version=$2 AND kind=ANY($3::text[])`, id, current.Version, stale); err != nil {
+				return err
+			}
 		}
 		_, err = tx.Exec(ctx, `UPDATE driver_onboarding_applications SET details=$3,
  draft_revision=draft_revision+1,updated_at=clock_timestamp()
