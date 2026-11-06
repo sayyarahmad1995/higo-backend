@@ -28,6 +28,8 @@ jobs:
         run: go test -race -count=1 -v ./...
       - name: Vet Go
         run: go vet ./...
+      - name: Test Admin Operations client
+        run: node --test internal/auth/admin_api_test.mjs
       - name: Build API image
         run: docker build -t higo-api:ci .
       - name: Smoke test API image

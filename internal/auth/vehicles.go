@@ -13,7 +13,7 @@ import (
 )
 
 const maxVehicleDocument = 2 * 1024 * 1024
-const vehicleColumns = `vehicle_id,version,make,model,manufacture_year,color,registration_number,status,submitted_at`
+const vehicleColumns = `vehicle_id,version,make,model,manufacture_year,color,registration_number,status,submitted_at,rejection_reason`
 const purgeSupersededVehicleDocuments = `UPDATE driver_vehicle_submissions v SET registration_image=NULL,insurance_image=NULL
  WHERE (v.user_id,v.vehicle_id,v.version) IN (SELECT old.user_id,old.vehicle_id,old.version FROM driver_vehicle_submissions old
  WHERE old.registration_image IS NOT NULL AND old.submitted_at<now()-interval '30 days'
@@ -38,20 +38,21 @@ type vehicleSubmissionInput struct {
 }
 
 type vehicleSubmission struct {
-	VehicleID    int64     `json:"vehicle_id"`
-	Version      int       `json:"version"`
-	Make         string    `json:"make"`
-	Model        string    `json:"model"`
-	Year         int       `json:"manufacture_year"`
-	Color        string    `json:"color"`
-	Registration string    `json:"registration_number"`
-	Status       string    `json:"status"`
-	SubmittedAt  time.Time `json:"submitted_at"`
+	VehicleID       int64     `json:"vehicle_id"`
+	Version         int       `json:"version"`
+	Make            string    `json:"make"`
+	Model           string    `json:"model"`
+	Year            int       `json:"manufacture_year"`
+	Color           string    `json:"color"`
+	Registration    string    `json:"registration_number"`
+	Status          string    `json:"status"`
+	SubmittedAt     time.Time `json:"submitted_at"`
+	RejectionReason string    `json:"rejection_reason,omitempty"`
 }
 
 func scanVehicle(row pgx.Row) (vehicleSubmission, error) {
 	var v vehicleSubmission
-	err := row.Scan(&v.VehicleID, &v.Version, &v.Make, &v.Model, &v.Year, &v.Color, &v.Registration, &v.Status, &v.SubmittedAt)
+	err := row.Scan(&v.VehicleID, &v.Version, &v.Make, &v.Model, &v.Year, &v.Color, &v.Registration, &v.Status, &v.SubmittedAt, &v.RejectionReason)
 	return v, err
 }
 

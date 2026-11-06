@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HiGO Admin Operations</title>
+<link rel="stylesheet" href="style.css">
+<script type="module" src="app.mjs"></script>
+<aside><strong>HiGO</strong><p>Admin Operations</p><a href="#queue">Onboarding review</a><button id="logout" hidden>Sign out</button></aside>
+<main>
+  <h1>Onboarding review</h1>
+  <p id="message" role="status" aria-live="polite"></p>
+  <form id="login">
+    <label>Reviewer phone <input name="phone" type="tel" autocomplete="username" required></label>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label>
+    <button>Sign in</button>
+  </form>
+  <section id="queue" hidden>
+    <button id="reload">Refresh queue</button>
+    <ul id="items"></ul>
+    <section id="selection" hidden>
+      <h2 id="title"></h2>
+      <div id="documents"></div>
+      <img id="preview" hidden alt="Submitted document">
+      <label>Reason for rejection <textarea id="reason" maxlength="1000"></textarea></label>
+      <button id="approve">Approve this version</button>
+      <button id="reject">Reject this version</button>
+    </section>
+  </section>
+</main>
+</html>

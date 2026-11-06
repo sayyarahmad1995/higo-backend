@@ -721,4 +721,120 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = post("recovery/request", phone)
 		expect(t, status, 202, body)
 	})
+
+	t.Run("review is privileged, audited and tied to the latest version", func(t *testing.T) {
+		const reviewerPhone = "+923061234567"
+		status, body := post("login", map[string]string{"phone": reviewerPhone, "password": oldPassword})
+		expect(t, status, 200, body)
+		reviewer := body["access_token"].(string)
+		status, body = call(http.MethodGet, "admin/onboarding", reviewer, nil)
+		expect(t, status, 403, body)
+		var ownerID int64
+		if err := isolated.QueryRow(ctx, `SELECT id FROM auth_users WHERE phone=$1`, phone).Scan(&ownerID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO onboarding_reviewers(user_id) SELECT id FROM auth_users WHERE phone=$1`, reviewerPhone); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodGet, "admin/onboarding", reviewer, nil)
+		expect(t, status, 200, body)
+		if len(body["submissions"].([]any)) < 2 {
+			t.Fatal(body)
+		}
+		document := map[string]any{"kind": "identity", "user_id": ownerID, "version": 4, "side": "front"}
+		status, body = call(http.MethodPost, "admin/onboarding/document", reviewer, document)
+		expect(t, status, 200, body)
+		if body["data"] == nil {
+			t.Fatal("document missing")
+		}
+		var audited int
+		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM onboarding_document_access WHERE user_id=$1 AND version=4`, ownerID).Scan(&audited); err != nil || audited != 1 {
+			t.Fatalf("audit count %d: %v", audited, err)
+		}
+		if _, err := isolated.Exec(ctx, `ALTER TABLE onboarding_document_access ADD CONSTRAINT test_audit_failure CHECK (false) NOT VALID`); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodPost, "admin/onboarding/document", reviewer, document)
+		expect(t, status, 500, body)
+		if body["data"] != nil {
+			t.Fatal("document disclosed without audit")
+		}
+		if _, err := isolated.Exec(ctx, `ALTER TABLE onboarding_document_access DROP CONSTRAINT test_audit_failure`); err != nil {
+			t.Fatal(err)
+		}
+		decision := map[string]any{"kind": "identity", "user_id": ownerID, "version": 3, "decision": "approved"}
+		status, body = call(http.MethodPost, "admin/onboarding/decision", reviewer, decision)
+		expect(t, status, 409, body)
+		decision["version"] = 4
+		results := make(chan response, 2)
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPost, "admin/onboarding/decision", reviewer, decision)
+				results <- response{status, body}
+			}()
+		}
+		a, b := <-results, <-results
+		if !((a.status == 200 && b.status == 409) || (a.status == 409 && b.status == 200)) {
+			t.Fatalf("decision results %v %v", a, b)
+		}
+		status, body = post("login", credentials)
+		expect(t, status, 200, body)
+		owner := body["access_token"].(string)
+		status, body = call(http.MethodGet, "me/driver-submission", owner, nil)
+		expect(t, status, 200, body)
+		if body["status"] != "approved" {
+			t.Fatal(body)
+		}
+		vehicleNumber, err := strconv.ParseInt(vehicleID, 10, 64)
+		if err != nil {
+			t.Fatal(err)
+		}
+		vehicleDecision := map[string]any{"kind": "vehicle", "user_id": ownerID, "vehicle_id": vehicleNumber, "version": 3, "decision": "rejected", "reason": "Registration image needs to be clearer"}
+		status, body = call(http.MethodPost, "admin/onboarding/decision", reviewer, vehicleDecision)
+		expect(t, status, 200, body)
+		status, body = call(http.MethodGet, "me/vehicles", owner, nil)
+		expect(t, status, 200, body)
+		vehicle := body["vehicles"].([]any)[0].(map[string]any)
+		if vehicle["status"] != "rejected" || vehicle["rejection_reason"] != vehicleDecision["reason"] {
+			t.Fatal(vehicle)
+		}
+		var picture bytes.Buffer
+		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodPost, "me/driver-submission", owner, map[string]any{"legal_name": "Revised Driver", "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes()})
+		expect(t, status, 201, body)
+		if body["status"] != "submitted" || body["version"] != float64(5) {
+			t.Fatal(body)
+		}
+		status, body = call(http.MethodPost, "admin/onboarding/document", owner, document)
+		expect(t, status, 403, body)
+		var reviewerID int64
+		if err := isolated.QueryRow(ctx, `SELECT id FROM auth_users WHERE phone=$1`, reviewerPhone).Scan(&reviewerID); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO onboarding_reviewers(user_id) VALUES($1)`, ownerID); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodPost, "me/driver-submission", reviewer, map[string]any{"legal_name": "Reviewer Applicant", "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes()})
+		expect(t, status, 201, body)
+		reviewerVersion := body["version"]
+		go func() {
+			status, body := call(http.MethodPost, "admin/onboarding/document", owner, map[string]any{"kind": "identity", "user_id": reviewerID, "version": reviewerVersion, "side": "front"})
+			results <- response{status, body}
+		}()
+		go func() {
+			status, body := call(http.MethodPost, "admin/onboarding/document", reviewer, map[string]any{"kind": "identity", "user_id": ownerID, "version": 5, "side": "front"})
+			results <- response{status, body}
+		}()
+		for range 2 {
+			result := <-results
+			expect(t, result.status, 200, result.body)
+		}
+		if _, err := isolated.Exec(ctx, `DELETE FROM onboarding_reviewers`); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodGet, "admin/onboarding", reviewer, nil)
+		expect(t, status, 403, body)
+	})
 }

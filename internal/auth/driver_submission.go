@@ -49,10 +49,11 @@ type driverSubmissionInput struct {
 }
 
 type driverSubmissionStatus struct {
-	Status      string     `json:"status"`
-	Version     int        `json:"version,omitempty"`
-	LegalName   string     `json:"legal_name,omitempty"`
-	SubmittedAt *time.Time `json:"submitted_at,omitempty"`
+	Status          string     `json:"status"`
+	Version         int        `json:"version,omitempty"`
+	LegalName       string     `json:"legal_name,omitempty"`
+	SubmittedAt     *time.Time `json:"submitted_at,omitempty"`
+	RejectionReason string     `json:"rejection_reason,omitempty"`
 }
 
 func newDriverDocumentCipher(key []byte) (cipher.AEAD, error) {
@@ -109,10 +110,10 @@ func (s *Server) driverSubmission(ctx context.Context, _ input, bearer string) (
 		return 0, nil, unauthorized
 	}
 	var result driverSubmissionStatus
-	err := s.db.QueryRow(ctx, `SELECT COALESCE(d.status,'not_submitted'),COALESCE(d.version,0),COALESCE(d.legal_name,''),d.submitted_at
- FROM auth_sessions s LEFT JOIN LATERAL (SELECT status,version,legal_name,submitted_at FROM driver_identity_submissions
+	err := s.db.QueryRow(ctx, `SELECT COALESCE(d.status,'not_submitted'),COALESCE(d.version,0),COALESCE(d.legal_name,''),d.submitted_at,COALESCE(d.rejection_reason,'')
+ FROM auth_sessions s LEFT JOIN LATERAL (SELECT status,version,legal_name,submitted_at,rejection_reason FROM driver_identity_submissions
  WHERE user_id=s.user_id ORDER BY version DESC LIMIT 1) d ON true
- WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>now() AND s.expires_at>now()`, digest).Scan(&result.Status, &result.Version, &result.LegalName, &result.SubmittedAt)
+ WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>now() AND s.expires_at>now()`, digest).Scan(&result.Status, &result.Version, &result.LegalName, &result.SubmittedAt, &result.RejectionReason)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, nil, unauthorized
 	}
