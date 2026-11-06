@@ -213,6 +213,12 @@ func TestAuthenticationFlow(t *testing.T) {
 			}()
 		}
 		first, second := <-versions, <-versions
+		if first.status == 503 {
+			first.status, first.body = call(http.MethodPost, "me/driver-submission", access, payload)
+		}
+		if second.status == 503 {
+			second.status, second.body = call(http.MethodPost, "me/driver-submission", access, payload)
+		}
 		expect(t, first.status, 201, first.body)
 		expect(t, second.status, 201, second.body)
 		if first.body["version"] == second.body["version"] {
@@ -297,6 +303,12 @@ func TestAuthenticationFlow(t *testing.T) {
 			}()
 		}
 		a, b := <-versions, <-versions
+		if a.status == 503 {
+			a.status, a.body = call(http.MethodPost, "me/vehicles", access, payload)
+		}
+		if b.status == 503 {
+			b.status, b.body = call(http.MethodPost, "me/vehicles", access, payload)
+		}
 		expect(t, a.status, 201, a.body)
 		expect(t, b.status, 201, b.body)
 		if a.body["version"] == b.body["version"] {
@@ -308,6 +320,17 @@ func TestAuthenticationFlow(t *testing.T) {
 		if len(latest) != 1 || latest[0].(map[string]any)["version"] != float64(3) {
 			t.Fatal(body)
 		}
+		for range cap(server.vehicleUploadSlots) {
+			server.vehicleUploadSlots <- struct{}{}
+		}
+		status, body = call(http.MethodPost, "me/vehicles", access, payload)
+		blocked := response{status, body}
+		status, body = call(http.MethodPost, "me/driver-submission", access, map[string]any{"legal_name": "Driver"})
+		for range cap(server.vehicleUploadSlots) {
+			<-server.vehicleUploadSlots
+		}
+		expect(t, blocked.status, 503, blocked.body)
+		expect(t, status, 400, body)
 	})
 	t.Run("driver membership comes from storage across sessions", func(t *testing.T) {
 		status, body := call(http.MethodGet, "me", access, nil)

@@ -5,6 +5,7 @@ import (
 	"crypto/cipher"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -44,6 +45,8 @@ type Server struct {
 	driverDocumentCipher cipher.AEAD
 	driverDocumentSlots  chan struct{}
 	driverUploadSlots    chan struct{}
+	vehicleUploadSlots   chan struct{}
+	activeUploadAccounts sync.Map
 	emailSender          EmailSender
 	db                   *pgxpool.Pool
 	sms                  SMS
@@ -81,7 +84,8 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 		return nil, err
 	}
 	s.driverDocumentSlots = make(chan struct{}, 2)
-	s.driverUploadSlots = make(chan struct{}, 4)
+	s.driverUploadSlots = make(chan struct{}, 2)
+	s.vehicleUploadSlots = make(chan struct{}, 2)
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
 }
@@ -191,10 +195,14 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 		}
 		limit := 60
 		documentUpload := method == http.MethodPost && (path == "me/driver-submission" || path == "me/vehicles")
-		if path == "auth/register" || path == "auth/recovery/request" || documentUpload || path == "me/driver-submission" {
+		if path == "auth/register" || path == "auth/recovery/request" || documentUpload {
 			limit = 10
 		}
-		if err := allow(ctx, s.db, path+"/ip/"+peer, time.Minute, limit); err != nil {
+		ratePath := path
+		if path == "me/driver-submission" || path == "me/vehicles" {
+			ratePath = method + "/" + path
+		}
+		if err := allow(ctx, s.db, ratePath+"/ip/"+peer, time.Minute, limit); err != nil {
 			respond(w, 0, nil, err)
 			return
 		}
@@ -202,13 +210,28 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
 			var maxBytes int64 = 4096
+			var releaseUpload func()
+			var uploadStarted time.Time
+			var cooldownKey string
 			var target any = &body
 			if method == http.MethodPatch {
 				target = &body.Profile
 			}
 			if documentUpload {
-				if _, _, err := s.me(ctx, input{}, bearer); err != nil {
+				_, account, err := s.me(ctx, input{}, bearer)
+				if err != nil {
 					respond(w, 0, nil, err)
+					return
+				}
+				id := account.(currentUser).ID
+				cooldownKey = hexDigest(fmt.Sprintf("document/slow-upload/%d", id))
+				var coolingDown bool
+				if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM auth_rate_limits WHERE key=$1 AND bucket=0 AND expires_at>now())`, cooldownKey).Scan(&coolingDown); err != nil {
+					respond(w, 0, nil, err)
+					return
+				}
+				if coolingDown {
+					respond(w, 0, nil, limited)
 					return
 				}
 				maxBytes = 3 * 1024 * 1024
@@ -221,10 +244,20 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					respond(w, 0, nil, documentTooLarge)
 					return
 				}
+				if _, active := s.activeUploadAccounts.LoadOrStore(id, struct{}{}); active {
+					respond(w, 0, nil, busy)
+					return
+				}
+				slots := s.driverUploadSlots
+				if vehicleUpload {
+					slots = s.vehicleUploadSlots
+				}
 				select {
-				case s.driverUploadSlots <- struct{}{}:
-					defer func() { <-s.driverUploadSlots }()
+				case slots <- struct{}{}:
+					defer func() { <-slots }()
+					releaseUpload = func() { s.activeUploadAccounts.Delete(id) }
 				default:
+					s.activeUploadAccounts.Delete(id)
 					respond(w, 0, nil, busy)
 					return
 				}
@@ -234,6 +267,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					readTimeout = 20 * time.Second
 				}
 				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
+				uploadStarted = time.Now()
 			}
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 			decoder.DisallowUnknownFields()
@@ -247,6 +281,15 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 				}
 			}
 			if decodeErr != nil {
+				if documentUpload && time.Since(uploadStarted) >= 5*time.Second {
+					penaltyCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
+					_, _ = s.db.Exec(penaltyCtx, `INSERT INTO auth_rate_limits(key,bucket,attempts,expires_at) VALUES ($1,0,1,now()+interval '60 seconds')
+ ON CONFLICT (key,bucket) DO UPDATE SET expires_at=excluded.expires_at`, cooldownKey)
+					stop()
+				}
+				if releaseUpload != nil {
+					releaseUpload()
+				}
 				var networkError net.Error
 				if documentUpload && errors.As(decodeErr, &networkError) && networkError.Timeout() {
 					respond(w, 0, nil, uploadTimeout)
@@ -259,6 +302,9 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 				}
 				respond(w, 0, nil, invalid)
 				return
+			}
+			if releaseUpload != nil {
+				releaseUpload()
 			}
 		}
 		status, result, err := run(ctx, body, bearer)
