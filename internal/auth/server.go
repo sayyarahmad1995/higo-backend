@@ -118,14 +118,15 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone     string `json:"phone"`
-	Password  string `json:"password"`
-	Name      string `json:"name"`
-	Email     string `json:"email"`
-	Challenge string `json:"challenge"`
-	Code      string `json:"code"`
-	Refresh   string `json:"refresh_token"`
-	Recovery  string `json:"recovery_token"`
+	Phone     string       `json:"phone"`
+	Password  string       `json:"password"`
+	Name      string       `json:"name"`
+	Email     string       `json:"email"`
+	Challenge string       `json:"challenge"`
+	Code      string       `json:"code"`
+	Refresh   string       `json:"refresh_token"`
+	Recovery  string       `json:"recovery_token"`
+	Profile   profilePatch `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -142,6 +143,7 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "POST", "auth/recovery/verify", s.verifyRecovery)
 	s.route(mux, "POST", "auth/recovery/reset", s.reset)
 	s.route(mux, "GET", "me", s.me)
+	s.route(mux, "PATCH", "me", s.updateProfile)
 	return mux
 }
 
@@ -164,10 +166,14 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			return
 		}
 		var body input
-		if method == "POST" && path != "auth/logout" {
+		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
 			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(&body); err != nil || decoder.Decode(new(any)) != io.EOF {
+			var target any = &body
+			if method == http.MethodPatch {
+				target = &body.Profile
+			}
+			if err := decoder.Decode(target); err != nil || decoder.Decode(new(any)) != io.EOF {
 				respond(w, 0, nil, invalid)
 				return
 			}

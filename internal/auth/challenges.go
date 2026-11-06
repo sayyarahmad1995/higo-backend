@@ -5,7 +5,6 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"errors"
-	"net/mail"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -24,14 +23,8 @@ func (s *Server) register(ctx context.Context, body input, _ string) (int, any, 
 	phone := phoneNumber(body.Phone)
 	name := strings.TrimSpace(body.Name)
 	email := strings.TrimSpace(body.Email)
-	if phone == "" || !validPassword(body.Password) || len(name) == 0 || len(name) > 150 || len(email) > 254 {
+	if phone == "" || !validPassword(body.Password) || !validProfileName(name) || !validProfileEmail(email) {
 		return 0, nil, invalid
-	}
-	if email != "" {
-		address, err := mail.ParseAddress(email)
-		if err != nil || address.Address != email {
-			return 0, nil, invalid
-		}
 	}
 	return s.issue(ctx, registration, phone, body.Password, name, email)
 }
