@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -41,7 +42,7 @@ func staleOnboardingEvidence(previous, current map[string]string) []string {
 	}
 	var stale []string
 	if changed("legal_name", "date_of_birth", "cnic_number") {
-		stale = append(stale, "cnic_front", "cnic_back", "license_front", "license_back")
+		stale = append(stale, "selfie", "cnic_front", "cnic_back", "license_front", "license_back")
 	}
 	if changed("make", "model", "manufacture_year", "color", "registration_number") {
 		stale = append(stale, "registration", "additional", "exterior_front", "exterior_rear",
@@ -53,6 +54,15 @@ func staleOnboardingEvidence(previous, current map[string]string) []string {
 func unexpired(value string, today time.Time) bool {
 	expiry, err := time.Parse(time.DateOnly, value)
 	return err == nil && !expiry.Before(today)
+}
+
+func validDraftExpiry(previous, details map[string]string, today time.Time) bool {
+	for _, field := range []string{"cnic_expiry", "license_expiry", "registration_expiry", "additional_expiry"} {
+		if value := details[field]; value != "" && value != previous[field] && !unexpired(value, today) {
+			return false
+		}
+	}
+	return true
 }
 
 func validDocumentDate(d map[string]string, prefix, noExpiry string, today time.Time) bool {
@@ -115,16 +125,34 @@ func (s *Server) saveOnboardingDocument(ctx context.Context, body input, bearer 
 		return 0, nil, err
 	}
 	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
-		if current.SubmittedAt != nil || current.Draft["revision"] != doc.Revision {
+		if current.SubmittedAt != nil {
 			return onboardingConflict
 		}
 		if current.Version == 0 || (doc.Kind != "selfie" && current.Draft["step"] != "2" && current.Draft["step"] != "3") {
 			return onboardingIncomplete
 		}
-		if err := allow(ctx, tx, fmt.Sprintf("onboarding/%s/%d", doc.Kind, id), 24*time.Hour, 5); err != nil {
+		aad := onboardingDocumentAAD(id, current.Version, doc.Kind)
+		if hasDocument(current.Documents, doc.Kind) {
+			var saved []byte
+			if err := tx.QueryRow(ctx, `SELECT image FROM driver_onboarding_documents
+ WHERE user_id=$1 AND application_version=$2 AND kind=$3`, id, current.Version, doc.Kind).Scan(&saved); err != nil {
+				return err
+			}
+			previous, err := s.driverDocumentCipher.Open(nil, nil, saved, aad)
+			if err != nil {
+				return err
+			}
+			if bytes.Equal(previous, normalized) {
+				return nil
+			}
+		}
+		if current.Draft["revision"] != doc.Revision {
+			return onboardingConflict
+		}
+		if err := allow(ctx, tx, fmt.Sprintf("onboarding/document-changes/%d", id), 15*time.Minute, 40); err != nil {
 			return err
 		}
-		encrypted := s.driverDocumentCipher.Seal(nil, nil, normalized, onboardingDocumentAAD(id, current.Version, doc.Kind))
+		encrypted := s.driverDocumentCipher.Seal(nil, nil, normalized, aad)
 		if _, err := tx.Exec(ctx, `INSERT INTO driver_onboarding_documents(user_id,application_version,kind,image)
  VALUES($1,$2,$3,$4) ON CONFLICT (user_id,application_version,kind) DO UPDATE SET image=excluded.image`, id, current.Version, doc.Kind, encrypted); err != nil {
 			return err

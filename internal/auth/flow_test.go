@@ -196,6 +196,22 @@ func TestAuthenticationFlow(t *testing.T) {
 		upload("selfie", make([]byte, maxVehicleDocument+1), 413)
 		upload("selfie", make([]byte, 3*maxVehicleDocument), 413)
 		apply(upload("selfie", picture.Bytes(), 200))
+		savedRevision := draft["revision"]
+		retry := update(http.MethodPost, path+"/document", map[string]any{
+			"draft_revision": "1", "kind": "selfie", "image": picture.Bytes(),
+		}, 200)
+		if retry["draft"].(map[string]any)["revision"] != savedRevision {
+			t.Fatal("an identical retry changed the draft revision")
+		}
+		for i := 1; i <= 6; i++ {
+			imageData := image.NewRGBA(image.Rect(0, 0, 2, 2))
+			imageData.Pix[0], imageData.Pix[3] = byte(i), 255
+			var replacement bytes.Buffer
+			if err := png.Encode(&replacement, imageData); err != nil {
+				t.Fatal(err)
+			}
+			apply(upload("selfie", replacement.Bytes(), 200))
+		}
 		status, body := post("login", credentials)
 		expect(t, status, 200, body)
 		restored := body["access_token"].(string)

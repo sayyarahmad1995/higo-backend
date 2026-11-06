@@ -142,15 +142,19 @@ func (s *Server) saveOnboarding(ctx context.Context, body input, bearer string) 
 			return invalid
 		}
 		priorStep, _ := strconv.Atoi(current.Draft["step"])
+		today := onboardingToday()
 		if step > priorStep+1 ||
-			(step >= 1 && (!completeDriver(details, onboardingToday()) || !hasDocument(current.Documents, "selfie"))) ||
-			(step >= 2 && !completeVehicle(details)) {
+			(step >= 1 && (!completeDriver(details, today) || !hasDocument(current.Documents, "selfie"))) ||
+			(step >= 2 && !completeVehicle(details)) || !validDraftExpiry(current.Draft, details, today) {
 			return onboardingIncomplete
 		}
 		details["step"] = strconv.Itoa(step)
 		stale := staleOnboardingEvidence(current.Draft, details)
-		if step == 3 && (len(stale) != 0 || !completeEvidence(details, current.Documents, onboardingToday())) {
+		if step == 3 && (len(stale) != 0 || !completeEvidence(details, current.Documents, today)) {
 			return onboardingIncomplete
+		}
+		if hasDocument(stale, "selfie") {
+			details["step"] = "0"
 		}
 		if current.Version == 0 {
 			_, err = tx.Exec(ctx, `INSERT INTO driver_onboarding_applications(user_id,details) VALUES($1,$2)`, id, details)
