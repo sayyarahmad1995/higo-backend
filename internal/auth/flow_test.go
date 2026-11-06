@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"image"
 	"image/png"
 	"net/http"
@@ -173,92 +172,84 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
-	t.Run("unified onboarding is resumable, bounded and immutable on submission", func(t *testing.T) {
+	t.Run("redesigned onboarding is resumable, bounded and immutable", func(t *testing.T) {
 		const path = "me/driver-application"
-		identityPath, vehiclePath := path+"/identity-documents", path+"/vehicle-documents"
-		get := func(token string) map[string]any {
-			t.Helper()
-			status, body := call(http.MethodGet, path, token, nil)
-			expect(t, status, 200, body)
-			return body
-		}
-		draftOf := func(body map[string]any) map[string]any { return body["draft"].(map[string]any) }
-		status, body := call(http.MethodGet, path, "", nil)
-		expect(t, status, 401, body)
-		if draftOf(get(access))["revision"] != "0" {
-			t.Fatal("unexpected draft")
-		}
-		fields := map[string]string{"step": "1", "revision": "0"}
-		status, body = call(http.MethodPatch, path, access, fields)
-		expect(t, status, 409, body)
-		fields["legal_name"] = "Example Driver"
-		status, body = call(http.MethodPatch, path, access, fields)
-		expect(t, status, 200, body)
-		fields["revision"] = "1"
-		fields["step"] = "2"
-		status, body = call(http.MethodPatch, path, access, fields)
-		expect(t, status, 409, body)
-		fields["make"], fields["model"], fields["manufacture_year"], fields["color"], fields["registration_number"] = "Test", "Car", "2020", "Black", "abc-123"
-		results := make(chan response, 2)
-		for range 2 {
-			go func() {
-				status, body := call(http.MethodPatch, path, access, fields)
-				results <- response{status, body}
-			}()
-		}
-		a, b := <-results, <-results
-		if !((a.status == 200 && b.status == 409) || (a.status == 409 && b.status == 200)) {
-			t.Fatalf("draft race %v %v", a, b)
-		}
 		var picture bytes.Buffer
 		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
 			t.Fatal(err)
 		}
-		identity := map[string]any{"draft_revision": "2", "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes()}
-		status, body = call(http.MethodPost, identityPath, "", identity)
-		expect(t, status, 401, body)
-		identity["cnic_front"] = []byte("bad image")
-		status, body = call(http.MethodPost, identityPath, access, identity)
-		expect(t, status, 400, body)
-		identity["cnic_front"] = make([]byte, maxDriverImage+1)
-		status, body = call(http.MethodPost, identityPath, access, identity)
-		expect(t, status, 413, body)
-		identity["cnic_back"] = make([]byte, 2*maxDriverImage)
-		status, body = call(http.MethodPost, identityPath, access, identity)
-		expect(t, status, 413, body)
-		identity["cnic_front"], identity["cnic_back"] = picture.Bytes(), picture.Bytes()
-		status, body = call(http.MethodPost, identityPath, access, identity)
-		expect(t, status, 200, body)
-		if draft := draftOf(body); draft["identity_saved"] != "true" || draft["revision"] != "3" {
-			t.Fatal(body)
+		draft := map[string]string{"revision": "0", "step": "0", "legal_name": "Example Driver", "date_of_birth": "1990-01-01", "cnic_number": "1234567890123"}
+		update := func(method, route string, data any, want int) map[string]any {
+			t.Helper()
+			status, body := call(method, route, access, data)
+			expect(t, status, want, body)
+			return body
 		}
-		status, body = call(http.MethodPost, path, access, map[string]string{"draft_revision": "3"})
-		expect(t, status, 409, body)
-		status, body = post("login", credentials)
+		apply := func(body map[string]any) { draft["revision"] = body["draft"].(map[string]any)["revision"].(string) }
+		upload := func(kind string, image []byte, want int) map[string]any {
+			return update(http.MethodPost, path+"/document", map[string]any{"draft_revision": draft["revision"], "kind": kind, "image": image}, want)
+		}
+		apply(update(http.MethodPatch, path, draft, 200))
+		draft["step"] = "1"
+		update(http.MethodPatch, path, draft, 409)
+		upload("selfie", []byte("bad image"), 400)
+		upload("selfie", make([]byte, maxVehicleDocument+1), 413)
+		upload("selfie", make([]byte, 3*maxVehicleDocument), 413)
+		apply(upload("selfie", picture.Bytes(), 200))
+		savedRevision := draft["revision"]
+		retry := update(http.MethodPost, path+"/document", map[string]any{
+			"draft_revision": "1", "kind": "selfie", "image": picture.Bytes(),
+		}, 200)
+		if retry["draft"].(map[string]any)["revision"] != savedRevision {
+			t.Fatal("an identical retry changed the draft revision")
+		}
+		for i := 1; i <= 6; i++ {
+			imageData := image.NewRGBA(image.Rect(0, 0, 2, 2))
+			imageData.Pix[0], imageData.Pix[3] = byte(i), 255
+			var replacement bytes.Buffer
+			if err := png.Encode(&replacement, imageData); err != nil {
+				t.Fatal(err)
+			}
+			apply(upload("selfie", replacement.Bytes(), 200))
+		}
+		status, body := post("login", credentials)
 		expect(t, status, 200, body)
 		restored := body["access_token"].(string)
-		if draft := draftOf(get(restored)); draft["identity_saved"] != "true" || draft["registration_number"] != "ABC-123" {
-			t.Fatal(draft)
-		}
-		vehicle := map[string]any{"draft_revision": "3", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes()}
-		for range cap(server.vehicleUploadSlots) {
-			server.vehicleUploadSlots <- struct{}{}
-		}
-		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
-		for range cap(server.vehicleUploadSlots) {
-			<-server.vehicleUploadSlots
-		}
-		expect(t, status, 503, body)
-		vehicle["insurance_image"] = make([]byte, maxVehicleDocument+1)
-		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
-		expect(t, status, 413, body)
-		vehicle["insurance_image"] = picture.Bytes()
-		status, body = call(http.MethodPost, vehiclePath, restored, vehicle)
+		status, body = call(http.MethodGet, path, restored, nil)
 		expect(t, status, 200, body)
-		fields["step"], fields["revision"], fields["registration_number"] = "3", "4", "ABC-123"
-		status, body = call(http.MethodPatch, path, restored, fields)
-		expect(t, status, 200, body)
-		final := map[string]string{"draft_revision": "5"}
+		if body["draft"].(map[string]any)["revision"] != draft["revision"] || len(body["documents"].([]any)) != 1 {
+			t.Fatal(body)
+		}
+		update(http.MethodGet, path+"/preview?kind=selfie", nil, 200)
+		apply(update(http.MethodPatch, path, draft, 200))
+		draft["step"], draft["make"], draft["model"], draft["manufacture_year"], draft["color"], draft["registration_number"] = "2", "Test", "Car", "2020", "Black", "ABC-123"
+		results := make(chan response, 2)
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPatch, path, restored, draft)
+				results <- response{status, body}
+			}()
+		}
+		a, b := <-results, <-results
+		if a.status == 409 {
+			a, b = b, a
+		}
+		expect(t, a.status, 200, a.body)
+		expect(t, b.status, 409, b.body)
+		apply(a.body)
+		upload("cnic_front", make([]byte, maxDriverImage+1), 413)
+		for _, kind := range requiredOnboardingDocuments[1:] {
+			apply(upload(kind, picture.Bytes(), 200))
+		}
+		apply(upload("additional", picture.Bytes(), 200))
+		apply(update(http.MethodDelete, path+"/document?kind=additional&draft_revision="+draft["revision"], nil, 200))
+		draft["step"], draft["cnic_validity"], draft["registration_validity"], draft["license_expiry"] = "3", "lifetime", "no_expiry", "2000-01-01"
+		update(http.MethodPatch, path, draft, 409)
+		draft["license_expiry"] = "2099-01-01"
+		apply(update(http.MethodPatch, path, draft, 200))
+		final := map[string]any{"draft_revision": draft["revision"], "confirmed": false}
+		update(http.MethodPost, path, final, 409)
+		final["confirmed"] = true
 		for range 2 {
 			go func() {
 				status, body := call(http.MethodPost, path, restored, final)
@@ -272,61 +263,31 @@ func TestAuthenticationFlow(t *testing.T) {
 				t.Fatal(result.body)
 			}
 		}
-		fields["revision"], fields["legal_name"] = "5", "Attempted Rewrite"
-		status, body = call(http.MethodPatch, path, restored, fields)
-		expect(t, status, 409, body)
-		identity["draft_revision"] = "5"
-		status, body = call(http.MethodPost, identityPath, restored, identity)
-		expect(t, status, 409, body)
-		if result := get(restored); result["status"] != "pending_review" || draftOf(result)["legal_name"] != "Example Driver" {
-			t.Fatal(result)
-		}
-		var encrypted [4][]byte
-		var applications int
-		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM driver_onboarding_applications`).Scan(&applications); err != nil || applications != 1 {
-			t.Fatalf("application count %d: %v", applications, err)
-		}
-		var ownerID int64
-		if err := isolated.QueryRow(ctx, `SELECT user_id,cnic_front,cnic_back,registration_image,insurance_image FROM driver_onboarding_applications`).
-			Scan(&ownerID, &encrypted[0], &encrypted[1], &encrypted[2], &encrypted[3]); err != nil {
-			t.Fatal(err)
-		}
-		cipher, err := newDriverDocumentCipher(bytes.Repeat([]byte{8}, 32))
+		draft["legal_name"] = "Attempted Rewrite"
+		update(http.MethodPatch, path, draft, 409)
+		upload("selfie", picture.Bytes(), 409)
+		update(http.MethodGet, path+"/preview?kind=selfie", nil, 409)
+		rows, err := isolated.Query(ctx, `SELECT user_id,kind,image FROM driver_onboarding_documents`)
 		if err != nil {
 			t.Fatal(err)
 		}
-		for i, side := range []string{"identity:front", "identity:back", "vehicle:registration", "vehicle:insurance"} {
-			aad := []byte(fmt.Sprintf("driver-onboarding:%d:1:%s", ownerID, side))
-			plain, err := cipher.Open(nil, nil, encrypted[i], aad)
-			if err != nil || !bytes.HasPrefix(plain, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted[i], picture.Bytes()[:8]) {
-				t.Fatalf("invalid encrypted %s: %v", side, err)
+		defer rows.Close()
+		count := 0
+		for rows.Next() {
+			var id int64
+			var kind string
+			var encrypted []byte
+			if err := rows.Scan(&id, &kind, &encrypted); err != nil {
+				t.Fatal(err)
 			}
-			if _, err := cipher.Open(nil, nil, encrypted[i], append(aad, '!')); err == nil {
-				t.Fatalf("%s decrypted against the wrong snapshot context", side)
+			data, err := server.driverDocumentCipher.Open(nil, nil, encrypted, onboardingDocumentAAD(id, 1, kind))
+			if err != nil || !bytes.HasPrefix(data, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted, picture.Bytes()[:8]) {
+				t.Fatalf("encryption of %s: %v", kind, err)
 			}
+			count++
 		}
-		// A database which ran the first replacement draft has this same table
-		// and an earlier migration marker. Applying migration 9 must keep it.
-		if _, err := isolated.Exec(ctx, `INSERT INTO driver_identity_submissions(user_id,version,legal_name,cnic_front,cnic_back)
- VALUES($1,1,'Legacy Driver',$2,$3)`, ownerID, encrypted[0], encrypted[1]); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := isolated.Exec(ctx, `INSERT INTO driver_vehicle_submissions(user_id,vehicle_id,version,make,model,manufacture_year,color,registration_number,registration_image,insurance_image)
- VALUES($1,1,1,'Legacy','Car',2020,'Black','LEG-123',$2,$3)`, ownerID, encrypted[2], encrypted[3]); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := isolated.Exec(ctx, `UPDATE schema_migrations SET version=7 WHERE version=9`); err != nil {
-			t.Fatal(err)
-		}
-		if err := migrations.Apply(ctx, isolated); err != nil {
-			t.Fatal(err)
-		}
-		var legacyIdentity, vehicleImage, snapshot []byte
-		if err := isolated.QueryRow(ctx, `SELECT i.cnic_front,v.registration_image,a.cnic_front
- FROM driver_identity_submissions i JOIN driver_vehicle_submissions v USING (user_id)
- JOIN driver_onboarding_applications a USING (user_id) WHERE i.user_id=$1`, ownerID).Scan(&legacyIdentity, &vehicleImage, &snapshot); err != nil ||
-			!bytes.Equal(legacyIdentity, encrypted[0]) || !bytes.Equal(vehicleImage, encrypted[2]) || !bytes.Equal(snapshot, encrypted[0]) {
-			t.Fatalf("upgrade changed stored evidence: %v", err)
+		if err := rows.Err(); err != nil || count != len(requiredOnboardingDocuments) {
+			t.Fatalf("evidence count %d: %v", count, err)
 		}
 		status, body = call(http.MethodGet, "me", restored, nil)
 		expect(t, status, 200, body)
@@ -477,9 +438,10 @@ func TestAuthenticationFlow(t *testing.T) {
 		}
 		status, body = call(http.MethodPost, "me/driver-application", otherAccess, map[string]string{"draft_revision": "5"})
 		expect(t, status, 409, body)
-		if _, err := isolated.Exec(ctx, `INSERT INTO driver_onboarding_applications(user_id,details,cnic_front,cnic_back,updated_at)
- SELECT id,'{"step":"2","legal_name":"Other Applicant"}',decode('01','hex'),decode('01','hex'),now()-interval '31 days'
- FROM auth_users WHERE phone='+923081234567'`); err != nil {
+		if _, err := isolated.Exec(ctx, `WITH draft AS (INSERT INTO driver_onboarding_applications(user_id,details,updated_at)
+ SELECT id,'{"step":"2","legal_name":"Other Applicant"}',now()-interval '31 days'
+ FROM auth_users WHERE phone='+923081234567' RETURNING user_id,application_version)
+ INSERT INTO driver_onboarding_documents SELECT user_id,application_version,'selfie',decode(repeat('01',29),'hex') FROM draft`); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := isolated.Exec(ctx, purgeAbandonedOnboardingDocuments); err != nil {
@@ -487,7 +449,7 @@ func TestAuthenticationFlow(t *testing.T) {
 		}
 		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
 		expect(t, status, 200, body)
-		if draft := body["draft"].(map[string]any); draft["identity_saved"] != nil || draft["legal_name"] != "Other Applicant" || draft["revision"] != "2" {
+		if draft := body["draft"].(map[string]any); len(body["documents"].([]any)) != 0 || draft["legal_name"] != "Other Applicant" || draft["revision"] != "2" {
 			t.Fatal("cleanup failed to expire evidence without deleting draft details", body)
 		}
 		status, body = verify(otherAccess, code)

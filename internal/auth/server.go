@@ -44,8 +44,7 @@ type Config struct {
 type Server struct {
 	driverDocumentCipher cipher.AEAD
 	driverDocumentSlots  chan struct{}
-	driverUploadSlots    chan struct{}
-	vehicleUploadSlots   chan struct{}
+	documentUploadSlots  chan struct{}
 	activeUploadAccounts sync.Map
 	emailSender          EmailSender
 	db                   *pgxpool.Pool
@@ -84,8 +83,7 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 		return nil, err
 	}
 	s.driverDocumentSlots = make(chan struct{}, 2)
-	s.driverUploadSlots = make(chan struct{}, 2)
-	s.vehicleUploadSlots = make(chan struct{}, 2)
+	s.documentUploadSlots = make(chan struct{}, 2)
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
 }
@@ -141,19 +139,19 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone              string                     `json:"phone"`
-	Password           string                     `json:"password"`
-	Name               string                     `json:"name"`
-	Email              string                     `json:"email"`
-	Challenge          string                     `json:"challenge"`
-	Code               string                     `json:"code"`
-	Refresh            string                     `json:"refresh_token"`
-	Recovery           string                     `json:"recovery_token"`
-	Profile            profilePatch               `json:"-"`
-	OnboardingDraft    map[string]string          `json:"-"`
-	OnboardingIdentity onboardingDocuments        `json:"-"`
-	OnboardingVehicle  onboardingVehicleDocuments `json:"-"`
-	OnboardingSubmit   onboardingSubmission       `json:"-"`
+	Phone              string               `json:"phone"`
+	Password           string               `json:"password"`
+	Name               string               `json:"name"`
+	Email              string               `json:"email"`
+	Challenge          string               `json:"challenge"`
+	Code               string               `json:"code"`
+	Refresh            string               `json:"refresh_token"`
+	Recovery           string               `json:"recovery_token"`
+	Profile            profilePatch         `json:"-"`
+	OnboardingDraft    map[string]string    `json:"-"`
+	OnboardingDocument onboardingDocument   `json:"-"`
+	OnboardingPreview  string               `json:"-"`
+	OnboardingSubmit   onboardingSubmission `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -176,8 +174,9 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "GET", onboardingPath, s.getOnboarding)
 	s.route(mux, "PATCH", onboardingPath, s.saveOnboarding)
 	s.route(mux, "POST", onboardingPath, s.submitOnboarding)
-	s.route(mux, "POST", onboardingPath+"/identity-documents", s.saveOnboardingIdentity)
-	s.route(mux, "POST", onboardingPath+"/vehicle-documents", s.saveOnboardingVehicle)
+	s.route(mux, "POST", onboardingPath+"/document", s.saveOnboardingDocument)
+	s.route(mux, "DELETE", onboardingPath+"/document", s.removeOnboardingDocument)
+	s.route(mux, "GET", onboardingPath+"/preview", s.previewOnboardingDocument)
 	return mux
 }
 
@@ -185,9 +184,9 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 	mux.HandleFunc(method+" /api/v1/"+path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
-		vehicleUpload := method == http.MethodPost && path == onboardingPath+"/vehicle-documents"
+		documentUpload := method == http.MethodPost && path == onboardingPath+"/document"
 		requestTimeout := 10 * time.Second
-		if vehicleUpload {
+		if documentUpload {
 			requestTimeout = 25 * time.Second
 			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
 		}
@@ -198,8 +197,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			peer = r.RemoteAddr
 		}
 		limit := 60
-		documentUpload := method == http.MethodPost && (path == onboardingPath+"/identity-documents" || path == onboardingPath+"/vehicle-documents")
-		if path == "auth/register" || path == "auth/recovery/request" || documentUpload {
+		if path == "auth/register" || path == "auth/recovery/request" {
 			limit = 10
 		}
 		ratePath := path
@@ -212,6 +210,24 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 		}
 		var body input
 		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if path == onboardingPath+"/preview" {
+			body.OnboardingPreview = r.URL.Query().Get("kind")
+			if _, _, err := s.me(ctx, input{}, bearer); err != nil {
+				respond(w, 0, nil, err)
+				return
+			}
+			select {
+			case s.driverDocumentSlots <- struct{}{}:
+				defer func() { <-s.driverDocumentSlots }()
+			default:
+				respond(w, 0, nil, busy)
+				return
+			}
+		}
+		if method == http.MethodDelete && path == onboardingPath+"/document" {
+			body.OnboardingDocument.Kind = r.URL.Query().Get("kind")
+			body.OnboardingDocument.Revision = r.URL.Query().Get("draft_revision")
+		}
 		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
 			var maxBytes int64 = 4096
 			var releaseUpload func()
@@ -245,11 +261,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					return
 				}
 				maxBytes = 3 * 1024 * 1024
-				target = &body.OnboardingIdentity
-				if path == onboardingPath+"/vehicle-documents" {
-					maxBytes = 6 * 1024 * 1024
-					target = &body.OnboardingVehicle
-				}
+				target = &body.OnboardingDocument
 				if r.ContentLength > maxBytes {
 					respond(w, 0, nil, documentTooLarge)
 					return
@@ -258,10 +270,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					respond(w, 0, nil, busy)
 					return
 				}
-				slots := s.driverUploadSlots
-				if vehicleUpload {
-					slots = s.vehicleUploadSlots
-				}
+				slots := s.documentUploadSlots
 				select {
 				case slots <- struct{}{}:
 					defer func() { <-slots }()
@@ -272,10 +281,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					return
 				}
 				// Limit how long a stalled client can hold an upload slot.
-				readTimeout := 5 * time.Second
-				if vehicleUpload {
-					readTimeout = 20 * time.Second
-				}
+				readTimeout := 20 * time.Second
 				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
 				uploadStarted = time.Now()
 			}
