@@ -98,11 +98,26 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 	if err := s.emailSender.Send(ctx, address, code); err != nil {
 		return 0, nil, busy
 	}
-	tag, err := s.db.Exec(ctx, `UPDATE auth_email_challenges SET delivered=true WHERE user_id=$1 AND digest=$2`, id, proof)
-	if err == nil && tag.RowsAffected() != 1 {
-		return 0, nil, invalid
-	}
-	return 202, map[string]int{"expires_in": 900, "resend_after": 60}, err
+	var profile currentUser
+	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
+		owner, err := lockEmailAccount(ctx, tx, digest)
+		if err != nil {
+			return err
+		}
+		if owner != id {
+			return unauthorized
+		}
+		tag, err := tx.Exec(ctx, `UPDATE auth_email_challenges SET delivered=true WHERE user_id=$1 AND digest=$2`, id, proof)
+		if err != nil {
+			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return invalid
+		}
+		profile, err = scanCurrentUser(tx.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_users u WHERE u.id=$1`, id))
+		return err
+	})
+	return 202, profile, err
 }
 
 func lockEmailAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
@@ -132,6 +147,7 @@ func (s *Server) verifyEmail(ctx context.Context, body input, bearer string) (in
 	if proof == nil {
 		return 0, nil, invalidCode
 	}
+	var profile currentUser
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		id, err := lockEmailAccount(ctx, tx, digest)
 		if err != nil {
@@ -147,8 +163,8 @@ func (s *Server) verifyEmail(ctx context.Context, body input, bearer string) (in
 		if err != nil {
 			return err
 		}
-		_, err = tx.Exec(ctx, `UPDATE auth_users SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1`, id, address)
+		profile, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+currentUserColumns, id, address))
 		return err
 	})
-	return 204, nil, err
+	return 200, profile, err
 }

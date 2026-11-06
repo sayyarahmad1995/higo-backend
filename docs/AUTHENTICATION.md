@@ -20,8 +20,8 @@ All paths below begin with `/api/v1`. POST requests with a body use JSON. Passwo
 | POST /auth/logout | Access bearer | 204 |
 | GET /me | Access bearer | 200 with `id`, `phone`, `name`, `email`, `capabilities` |
 | PATCH /me | Access bearer and `name`, `email`, or both | 200 with the updated `/me` response |
-| POST /me/email/request | Access bearer, `email`, and current `password` | 202 after the mail provider accepts the code |
-| POST /me/email/verify | Access bearer and email `code` | 204 after verification |
+| POST /me/email/request | Access bearer, `email`, and current `password` | 202 with the updated `/me` response after the mail provider accepts the code |
+| POST /me/email/verify | Access bearer and email `code` | 200 with the verified `/me` response |
 
 Session responses include `access_token`, `refresh_token`, and `expires_in` in seconds. Errors are JSON with an `error` code. Invalid and expired verification proofs return 400. Unknown phones and incorrect passwords return 401 with `invalid_credentials`. Invalid, expired, or revoked session tokens return 401. Throttling returns 429. A saturated password worker returns 503.
 

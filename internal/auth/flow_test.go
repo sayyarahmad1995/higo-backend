@@ -283,7 +283,10 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = request("first@example.test", credentials["password"])
 		expect(t, status, 429, body)
 		status, body = verify(access, <-emails)
-		expect(t, status, 204, body)
+		expect(t, status, 200, body)
+		if body["email_verified"] != true || body["email"] != "first@example.test" {
+			t.Fatal("verification response missing profile", body)
+		}
 		status, body = call(http.MethodPatch, "me", access, map[string]string{"email": "bypass@example.test"})
 		expect(t, status, 400, body)
 		resetCooldown()
@@ -316,7 +319,7 @@ func TestAuthenticationFlow(t *testing.T) {
 			go func() { status, _ := verify(access, code); results <- status }()
 		}
 		a, b := <-results, <-results
-		if !((a == 204 && b == 400) || (a == 400 && b == 204)) {
+		if !((a == 200 && b == 400) || (a == 400 && b == 200)) {
 			t.Fatalf("concurrent verification statuses %d, %d", a, b)
 		}
 		status, body = verify(access, code)
