@@ -86,7 +86,7 @@ func (s *Server) issue(ctx context.Context, purpose, phone string, hash *string,
 	if err != nil {
 		return 0, nil, err
 	}
-	s.deliveries <- delivery{id, phone, code, send}
+	s.dispatchSMS(delivery{id, phone, code, send})
 	queued = true
 	return 202, map[string]any{"challenge": challenge, "expires_in": 300, "resend_after": 60}, nil
 }

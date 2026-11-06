@@ -37,16 +37,16 @@ type Config struct {
 }
 
 type Server struct {
-	db         *pgxpool.Pool
-	sms        SMS
-	passwords  passwords
-	otpKey     []byte
-	dummyHash  string
-	hashSlots  chan struct{}
-	deliveries chan delivery
-	smsSlots   chan struct{}
-	cancel     context.CancelFunc
-	worker     sync.WaitGroup
+	db              *pgxpool.Pool
+	sms             SMS
+	passwords       passwords
+	otpKey          []byte
+	dummyHash       string
+	hashSlots       chan struct{}
+	deliveryContext context.Context
+	smsSlots        chan struct{}
+	cancel          context.CancelFunc
+	worker          sync.WaitGroup
 }
 
 type delivery struct {
@@ -66,36 +66,30 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 	}
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{db: db, sms: sms, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
-		hashSlots: make(chan struct{}, 2), deliveries: make(chan delivery, 32), smsSlots: make(chan struct{}, 32), cancel: cancel}
-	s.worker.Go(func() { s.runDelivery(ctx) })
+		hashSlots: make(chan struct{}, 2), deliveryContext: ctx, smsSlots: make(chan struct{}, 32), cancel: cancel}
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
 }
 
 func (s *Server) Close() { s.cancel(); s.worker.Wait() }
 
-func (s *Server) runDelivery(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case item := <-s.deliveries:
-			if !item.send {
-				<-s.smsSlots
-				continue
-			}
-			timeout, cancel := context.WithTimeout(ctx, 10*time.Second)
+func (s *Server) dispatchSMS(item delivery) {
+	timeout, cancel := context.WithTimeout(s.deliveryContext, 10*time.Second)
+	s.worker.Go(func() {
+		defer cancel()
+		if item.send {
 			err := s.sms.Send(timeout, item.phone, item.code)
 			if err == nil {
 				_, err = s.db.Exec(timeout, `UPDATE auth_challenges SET delivered=true WHERE id=$1 AND expires_at>now()`, item.id)
 			}
-			cancel()
-			<-s.smsSlots
-			if err != nil {
+			if err != nil && s.deliveryContext.Err() == nil {
 				slog.Warn("auth_sms_delivery_failed")
 			}
 		}
-	}
+		// Keep capacity occupied equally for real and suppressed deliveries.
+		<-timeout.Done()
+		<-s.smsSlots
+	})
 }
 
 func (s *Server) cleanup(ctx context.Context) {

@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,9 +16,18 @@ import (
 	"github.com/sayyarahmad1995/higo-backend/migrations"
 )
 
-type testSMS struct{ codes chan string }
+type testSMS struct {
+	codes   chan string
+	stall   atomic.Bool
+	started chan struct{}
+}
 
-func (s testSMS) Send(_ context.Context, _, code string) error {
+func (s *testSMS) Send(ctx context.Context, phone, code string) error {
+	if phone == "+923001234567" && s.stall.Load() {
+		close(s.started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	s.codes <- code
 	return nil
 }
@@ -55,7 +65,7 @@ func TestAuthenticationFlow(t *testing.T) {
 	if err := migrations.Apply(ctx, isolated); err != nil {
 		t.Fatal(err)
 	}
-	sms := testSMS{make(chan string, 4)}
+	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	server, err := New(ctx, isolated, sms, Config{OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
@@ -296,5 +306,23 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, status, 401, body)
 		status, body = post("register/verify", map[string]string{"challenge": challenge, "code": code})
 		expect(t, status, 201, body)
+	})
+
+	t.Run("a stalled SMS does not delay another recipient", func(t *testing.T) {
+		const other = "+923061234567"
+		if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key IN ($1,$2)", hexDigest("sms/phone/"+phone), hexDigest("sms/phone/"+other)); err != nil {
+			t.Fatal(err)
+		}
+		sms.stall.Store(true)
+		status, body := post("recovery/request", map[string]string{"phone": phone})
+		expect(t, status, 202, body)
+		select {
+		case <-sms.started:
+		case <-time.After(3 * time.Second):
+			t.Fatal("first delivery never started")
+		}
+		status, body = post("recovery/request", map[string]string{"phone": other})
+		expect(t, status, 202, body)
+		receiveCode(t, body["challenge"].(string))
 	})
 }
