@@ -158,6 +158,9 @@ func (s *Server) submitDriverIdentity(ctx context.Context, body input, bearer st
 		if err := tx.QueryRow(ctx, `SELECT COALESCE(MAX(version),0)+1 FROM driver_identity_submissions WHERE user_id=$1`, id).Scan(&result.Version); err != nil {
 			return err
 		}
+		if result.Version > 250 {
+			return documentQuota
+		}
 		associated := fmt.Sprintf("driver-cnic:%d:%d:", id, result.Version)
 		return tx.QueryRow(ctx, `INSERT INTO driver_identity_submissions (user_id,version,legal_name,cnic_front,cnic_back)
  VALUES ($1,$2,$3,$4,$5) RETURNING submitted_at`, id, result.Version, name,

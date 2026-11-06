@@ -200,6 +200,10 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					return
 				}
 				maxBytes = 3 * 1024 * 1024
+				if r.ContentLength > maxBytes {
+					respond(w, 0, nil, documentTooLarge)
+					return
+				}
 				target = &body.DriverSubmission
 				select {
 				case s.driverUploadSlots <- struct{}{}:

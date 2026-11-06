@@ -3,11 +3,8 @@ CREATE TABLE driver_identity_submissions (
     version integer NOT NULL CHECK (version > 0),
     legal_name text NOT NULL CHECK (octet_length(legal_name) BETWEEN 1 AND 150),
     status text NOT NULL DEFAULT 'submitted' CHECK (status = 'submitted'),
-    cnic_front bytea,
-    cnic_back bytea,
+    cnic_front bytea NOT NULL,
+    cnic_back bytea NOT NULL,
     submitted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
-    PRIMARY KEY (user_id, version),
-    CHECK ((cnic_front IS NULL) = (cnic_back IS NULL)),
-    CHECK (octet_length(cnic_front) <= 1048604 AND octet_length(cnic_back) <= 1048604)
+    PRIMARY KEY (user_id, version)
 );
-CREATE INDEX driver_identity_document_expiry ON driver_identity_submissions (submitted_at) WHERE cnic_front IS NOT NULL;
