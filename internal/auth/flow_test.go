@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -20,6 +22,16 @@ type testSMS struct {
 	codes   chan string
 	stall   atomic.Bool
 	started chan struct{}
+}
+
+type testEmail chan string
+
+func (s testEmail) Send(_ context.Context, address, code string) error {
+	s <- code
+	if address == "failed@example.test" {
+		return errors.New("test provider unavailable")
+	}
+	return nil
 }
 
 func (s *testSMS) Send(ctx context.Context, phone, code string) error {
@@ -66,7 +78,8 @@ func TestAuthenticationFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
-	server, err := New(ctx, isolated, sms, Config{OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	emails := make(testEmail, 4)
+	server, err := New(ctx, isolated, sms, Config{EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +133,7 @@ func TestAuthenticationFlow(t *testing.T) {
 	const phone = "+923001234567"
 	const oldPassword = "the original password"
 	const newPassword = "the replacement password"
-	credentials := map[string]string{"phone": phone, "password": oldPassword, "name": "Test Rider"}
+	credentials := map[string]string{"phone": phone, "password": oldPassword, "name": "Test Rider", "email": "signup@example.test"}
 	status, unknown := post("login", credentials)
 	expect(t, status, 401, unknown)
 	status, body := post("register", credentials)
@@ -156,6 +169,9 @@ func TestAuthenticationFlow(t *testing.T) {
 	expect(t, status, 200, body)
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
+	}
+	if body["email"] != "signup@example.test" || body["email_verified"] != false || body["pending_email"] != "" || len(emails) != 0 {
+		t.Fatal("registration must store email unverified without sending", body)
 	}
 	t.Run("driver membership comes from storage across sessions", func(t *testing.T) {
 		status, body := call(http.MethodGet, "me", access, nil)
@@ -244,6 +260,89 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, late.status, 401, late.body)
 		status, body = patch(secondAccess, map[string]any{"name": "Other"})
 		expect(t, status, 401, body)
+	})
+	t.Run("email replacement stays pending and proof is account-bound and single-use", func(t *testing.T) {
+		if len(emails) != 0 {
+			t.Fatal("registration sent verification email")
+		}
+		var id int64
+		if err := isolated.QueryRow(ctx, `SELECT id FROM auth_users WHERE phone=$1`, phone).Scan(&id); err != nil {
+			t.Fatal(err)
+		}
+		resetCooldown := func() {
+			if _, err := isolated.Exec(ctx, `DELETE FROM auth_rate_limits WHERE key=$1`, hexDigest("email/account/"+strconv.FormatInt(id, 10))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		request := func(address, password string) (int, map[string]any) {
+			return call(http.MethodPost, "me/email/request", access, map[string]string{"email": address, "password": password})
+		}
+		verify := func(token, code string) (int, map[string]any) {
+			return call(http.MethodPost, "me/email/verify", token, map[string]string{"code": code})
+		}
+		status, body := request("first@example.test", "an incorrect password")
+		expect(t, status, 400, body)
+		status, body = request("first@example.test", credentials["password"])
+		expect(t, status, 202, body)
+		status, body = request("first@example.test", credentials["password"])
+		expect(t, status, 429, body)
+		status, body = verify(access, <-emails)
+		expect(t, status, 200, body)
+		if body["email_verified"] != true || body["email"] != "first@example.test" {
+			t.Fatal("verification response missing profile", body)
+		}
+		status, body = call(http.MethodPatch, "me", access, map[string]string{"email": "bypass@example.test"})
+		expect(t, status, 400, body)
+		resetCooldown()
+		status, body = request("next@example.test", credentials["password"])
+		expect(t, status, 202, body)
+		code := <-emails
+		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if body["email"] != "first@example.test" || body["pending_email"] != "next@example.test" || body["email_verified"] != true {
+			t.Fatal("incorrect replacement state", body)
+		}
+		if _, err := isolated.Exec(ctx, `INSERT INTO auth_users (phone,name,password_hash) SELECT '+923081234567','Other',password_hash FROM auth_users WHERE id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+		status, body = post("login", map[string]string{"phone": "+923081234567", "password": credentials["password"]})
+		expect(t, status, 200, body)
+		status, body = verify(body["access_token"].(string), code)
+		expect(t, status, 400, body)
+		if _, err := isolated.Exec(ctx, `UPDATE auth_email_challenges SET expires_at=now()-interval '1 second' WHERE user_id=$1`, id); err != nil {
+			t.Fatal(err)
+		}
+		status, body = verify(access, code)
+		expect(t, status, 400, body)
+		resetCooldown()
+		status, body = request("next@example.test", credentials["password"])
+		expect(t, status, 202, body)
+		code = <-emails
+		results := make(chan int, 2)
+		for range 2 {
+			go func() { status, _ := verify(access, code); results <- status }()
+		}
+		a, b := <-results, <-results
+		if !((a == 200 && b == 400) || (a == 400 && b == 200)) {
+			t.Fatalf("concurrent verification statuses %d, %d", a, b)
+		}
+		status, body = verify(access, code)
+		expect(t, status, 400, body)
+		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if body["email"] != "next@example.test" || body["pending_email"] != "" || body["email_verified"] != true {
+			t.Fatal("replacement not applied", body)
+		}
+		resetCooldown()
+		status, body = request("failed@example.test", credentials["password"])
+		expect(t, status, 503, body)
+		status, body = verify(access, <-emails)
+		expect(t, status, 400, body)
+		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if body["email"] != "next@example.test" || body["pending_email"] != "" || body["email_verified"] != true {
+			t.Fatal("failed delivery changed the trusted address or exposed a pending address", body)
+		}
 	})
 	status, body = post("login", map[string]string{"phone": phone, "password": "an incorrect password"})
 	expect(t, status, 401, body)

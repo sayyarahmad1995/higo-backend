@@ -63,7 +63,12 @@ func loadConfig() (config, error) {
 			return cfg, errors.New("development SMS requires a loopback listener")
 		}
 		cfg.sms = localSMS{}
+		cfg.auth.EmailSender = localEmail{}
 	case "production":
+		cfg.auth.EmailSender, err = productionEmail()
+		if err != nil {
+			return cfg, err
+		}
 		cfg.sms, err = sms.NewTwilio(os.Getenv("TWILIO_ACCOUNT_SID"), os.Getenv("TWILIO_AUTH_TOKEN"), os.Getenv("TWILIO_MESSAGING_SERVICE_SID"))
 		if err != nil {
 			return cfg, err

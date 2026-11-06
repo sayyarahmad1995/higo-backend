@@ -20,12 +20,18 @@ All paths below begin with `/api/v1`. POST requests with a body use JSON. Passwo
 | POST /auth/logout | Access bearer | 204 |
 | GET /me | Access bearer | 200 with `id`, `phone`, `name`, `email`, `capabilities` |
 | PATCH /me | Access bearer and `name`, `email`, or both | 200 with the updated `/me` response |
+| POST /me/email/request | Access bearer, `email`, and current `password` | 202 with the updated `/me` response after the mail provider accepts the code |
+| POST /me/email/verify | Access bearer and email `code` | 200 with the verified `/me` response |
 
 Session responses include `access_token`, `refresh_token`, and `expires_in` in seconds. Errors are JSON with an `error` code. Invalid and expired verification proofs return 400. Unknown phones and incorrect passwords return 401 with `invalid_credentials`. Invalid, expired, or revoked session tokens return 401. Throttling returns 429. A saturated password worker returns 503.
 
 Profile updates apply only to the account identified by the access token. Omitted or `null` fields stay unchanged, and at least one string field is required. The API trims surrounding whitespace, accepts names up to 150 UTF-8 bytes and email addresses up to 254 bytes, and clears email when sent an empty string. Other fields are rejected. Changing a verified phone requires a separate verification flow. Flutter loads the profile through `/me` at sign-in and session restoration and displays the server response after an edit.
 
 ## Security behavior
+
+- Registration stores the optional email as unverified and sends only the phone verification SMS. Email verification is optional. `/me` reports `email_verified` and `pending_email` alongside `email`. An empty `email` means no address. An unverified address may be edited or cleared through the profile API. A verified address stays active until its replacement is confirmed and ordinary profile updates cannot replace or clear it.
+- Issuing an email code requires the current password. The 15-minute code is single-use, bound to the account and password version, and stored as a digest. Resends replace the old challenge. PostgreSQL applies a rolling 60-second account cooldown plus recipient, global, and password-attempt budgets. Verification consumes the code and updates the address atomically. Unverified and pending addresses carry no trust for recovery or sensitive delivery.
+- The loopback development API prints test codes locally. Production email uses Resend when `RESEND_API_KEY` and `HIGO_EMAIL_FROM` are configured. Without those settings, verification requests return 503 and the optional email remains usable as unverified profile data. Validate provider delivery and failure handling before enabling the feature in production.
 
 - An accepted issuance request returns 202 before SMS delivery. Repeat the original issuance request to resend after 60 seconds. Each issuance has its own challenge and code. Challenges expire in five minutes and allow five guesses. Only a challenge acknowledged by the SMS gateway can be verified. A failed send or process restart before acknowledgment requires a new issuance. Duplicate registration and unknown-phone recovery return an unusable challenge without sending SMS.
 - Challenges store keyed OTP digests. PostgreSQL consumes an OTP in the same transaction as account creation or recovery grant issuance. Registration creates the account only after successful verification. A unique phone constraint handles concurrent registration.

@@ -54,19 +54,29 @@ func (s *Server) updateProfile(ctx context.Context, body input, bearer string) (
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		// Match password reset's account-then-session lock order.
 		var userID int64
-		err := tx.QueryRow(ctx, `SELECT u.id FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
+		var email string
+		var emailVerified bool
+		err := tx.QueryRow(ctx, `SELECT u.id,u.email,u.email_verified_at IS NOT NULL FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
  WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>clock_timestamp()
- AND s.expires_at>clock_timestamp() FOR UPDATE OF u`, digest).Scan(&userID)
+ AND s.expires_at>clock_timestamp() FOR UPDATE OF u`, digest).Scan(&userID, &email, &emailVerified)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return unauthorized
 		}
 		if err != nil {
 			return err
 		}
+		if patch.Email != nil && *patch.Email != email {
+			if emailVerified {
+				return invalid
+			}
+			if _, err := tx.Exec(ctx, `DELETE FROM auth_email_challenges WHERE user_id=$1`, userID); err != nil {
+				return err
+			}
+		}
 		result, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET name=COALESCE($3,u.name),email=COALESCE($4,u.email)
  WHERE u.id=$2 AND EXISTS (SELECT 1 FROM auth_sessions s WHERE s.user_id=u.id AND s.access_digest=$1
  AND s.revoked_at IS NULL AND s.access_expires_at>clock_timestamp() AND s.expires_at>clock_timestamp() FOR SHARE OF s)
- RETURNING u.id,u.phone,u.name,u.email,u.has_driver_capability`, digest, userID, patch.Name, patch.Email))
+ RETURNING `+currentUserColumns, digest, userID, patch.Name, patch.Email))
 		return err
 	})
 	return 200, result, err
