@@ -29,6 +29,9 @@ var vehicleSubmissions string
 //go:embed 009_driver_onboarding.sql
 var driverOnboarding string
 
+//go:embed 010_onboarding_documents.sql
+var onboardingDocuments string
+
 // Apply serializes migration runners and commits each schema change with its version.
 func Apply(ctx context.Context, db *pgxpool.Pool) error {
 	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
@@ -50,6 +53,7 @@ func Apply(ctx context.Context, db *pgxpool.Pool) error {
 			{6, vehicleSubmissions},
 			// Versions 7 and 8 were used in discarded draft branches.
 			{9, driverOnboarding},
+			{10, onboardingDocuments},
 		} {
 			version := migration.version
 			var applied bool
