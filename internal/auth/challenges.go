@@ -33,14 +33,7 @@ func (s *Server) register(ctx context.Context, body input, _ string) (int, any, 
 			return 0, nil, invalid
 		}
 	}
-	if err := s.reserveSMS(ctx, registration, phone); err != nil {
-		return 0, nil, err
-	}
-	hash, err := s.hash(body.Password)
-	if err != nil {
-		return 0, nil, err
-	}
-	return s.issue(ctx, registration, phone, &hash, name, email)
+	return s.issue(ctx, registration, phone, body.Password, name, email)
 }
 
 func (s *Server) requestRecovery(ctx context.Context, body input, _ string) (int, any, error) {
@@ -48,13 +41,10 @@ func (s *Server) requestRecovery(ctx context.Context, body input, _ string) (int
 	if phone == "" {
 		return 0, nil, invalid
 	}
-	if err := s.reserveSMS(ctx, recovery, phone); err != nil {
-		return 0, nil, err
-	}
-	return s.issue(ctx, recovery, phone, nil, "", "")
+	return s.issue(ctx, recovery, phone, "", "", "")
 }
 
-func (s *Server) issue(ctx context.Context, purpose, phone string, hash *string, name, email string) (int, any, error) {
+func (s *Server) issue(ctx context.Context, purpose, phone, password, name, email string) (int, any, error) {
 	select {
 	case s.smsSlots <- struct{}{}:
 	default:
@@ -66,6 +56,17 @@ func (s *Server) issue(ctx context.Context, purpose, phone string, hash *string,
 			<-s.smsSlots
 		}
 	}()
+	if err := s.reserveSMS(ctx, purpose, phone); err != nil {
+		return 0, nil, err
+	}
+	var passwordHash *string
+	if purpose == registration {
+		hash, err := s.hash(password)
+		if err != nil {
+			return 0, nil, err
+		}
+		passwordHash = &hash
+	}
 	challenge, err := newToken("oc_")
 	if err != nil {
 		return 0, nil, err
@@ -82,7 +83,7 @@ func (s *Server) issue(ctx context.Context, purpose, phone string, hash *string,
  CASE WHEN $2='recovery' THEN account.password_version END,$4,$5,$6,$7,now()+interval '5 minutes'
  FROM (SELECT 1) AS seed LEFT JOIN account ON true
  RETURNING CASE WHEN purpose='recovery' THEN user_id IS NOT NULL ELSE NOT EXISTS(SELECT 1 FROM account) END`,
-		id, purpose, phone, hash, name, email, s.otpDigest(purpose, challenge, code)).Scan(&send)
+		id, purpose, phone, passwordHash, name, email, s.otpDigest(purpose, challenge, code)).Scan(&send)
 	if err != nil {
 		return 0, nil, err
 	}

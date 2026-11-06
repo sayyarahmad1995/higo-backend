@@ -325,4 +325,19 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, status, 202, body)
 		receiveCode(t, body["challenge"].(string))
 	})
+
+	t.Run("SMS overload preserves the phone cooldown", func(t *testing.T) {
+		phone := map[string]string{"phone": "+923071234567"}
+		added := cap(server.smsSlots) - len(server.smsSlots)
+		for range added {
+			server.smsSlots <- struct{}{}
+		}
+		status, body := post("recovery/request", phone)
+		for range added {
+			<-server.smsSlots
+		}
+		expect(t, status, 503, body)
+		status, body = post("recovery/request", phone)
+		expect(t, status, 202, body)
+	})
 }
