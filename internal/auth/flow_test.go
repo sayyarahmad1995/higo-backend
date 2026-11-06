@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"image"
+	"image/png"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -79,7 +81,7 @@ func TestAuthenticationFlow(t *testing.T) {
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	emails := make(testEmail, 4)
-	server, err := New(ctx, isolated, sms, Config{EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	server, err := New(ctx, isolated, sms, Config{DriverDocumentKey: bytes.Repeat([]byte{8}, 32), EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -170,6 +172,93 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
+	t.Run("driver identity submissions are authenticated and versioned", func(t *testing.T) {
+		var imageBytes bytes.Buffer
+		if err := png.Encode(&imageBytes, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		payload := map[string]any{"legal_name": "Example Driver", "cnic_front": imageBytes.Bytes(), "cnic_back": imageBytes.Bytes()}
+		status, body := call(http.MethodPost, "me/driver-submission", "", payload)
+		expect(t, status, 401, body)
+		status, body = call(http.MethodGet, "me/driver-submission", access, nil)
+		expect(t, status, 200, body)
+		if body["status"] != "not_submitted" {
+			t.Fatal(body)
+		}
+		payload["cnic_back"] = []byte("not an image")
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 400, body)
+		payload["cnic_back"] = imageBytes.Bytes()
+		payload["approved"] = true
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 400, body)
+		delete(payload, "approved")
+		for version := 1; version <= 2; version++ {
+			status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+			expect(t, status, 201, body)
+			if body["status"] != "submitted" || body["version"] != float64(version) || body["cnic_front"] != nil {
+				t.Fatal(body)
+			}
+		}
+		status, body = call(http.MethodGet, "me/driver-submission", access, nil)
+		expect(t, status, 200, body)
+		if body["version"] != float64(2) {
+			t.Fatal(body)
+		}
+		versions := make(chan response, 2)
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPost, "me/driver-submission", access, payload)
+				versions <- response{status, body}
+			}()
+		}
+		first, second := <-versions, <-versions
+		expect(t, first.status, 201, first.body)
+		expect(t, second.status, 201, second.body)
+		if first.body["version"] == second.body["version"] {
+			t.Fatal("concurrent submissions reused a version")
+		}
+		var encrypted []byte
+		if err := isolated.QueryRow(ctx, `SELECT d.cnic_front FROM driver_identity_submissions d JOIN auth_users u ON u.id=d.user_id WHERE u.phone=$1 AND d.version=1`, phone).Scan(&encrypted); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.HasPrefix(encrypted, imageBytes.Bytes()[:8]) {
+			t.Fatal("document stored as plaintext")
+		}
+		status, body = call(http.MethodGet, "me", access, nil)
+		expect(t, status, 200, body)
+		if capabilities := body["capabilities"].([]any); len(capabilities) != 1 || capabilities[0] != "rider" {
+			t.Fatal("submission changed membership", body)
+		}
+		previousPeer := peer
+		peer = "192.0.2.99:12345"
+		defer func() { peer = previousPeer }()
+		payload["cnic_front"] = make([]byte, maxDriverImage+1)
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 413, body)
+		if body["error"] != "document_too_large" {
+			t.Fatal(body)
+		}
+		if _, err := isolated.Exec(ctx, `UPDATE driver_identity_submissions SET submitted_at=now()-interval '31 days'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, purgeSupersededDriverDocuments); err != nil {
+			t.Fatal(err)
+		}
+		var versionsLeft, imagesLeft int
+		if err := isolated.QueryRow(ctx, `SELECT count(*),count(cnic_front) FROM driver_identity_submissions`).Scan(&versionsLeft, &imagesLeft); err != nil {
+			t.Fatal(err)
+		}
+		if versionsLeft != 4 || imagesLeft != 1 {
+			t.Fatalf("cleanup kept %d versions and %d document pairs", versionsLeft, imagesLeft)
+		}
+		payload["cnic_back"] = make([]byte, 2*maxDriverImage)
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 413, body)
+		if body["error"] != "document_too_large" {
+			t.Fatal(body)
+		}
+	})
 	if body["email"] != "signup@example.test" || body["email_verified"] != false || body["pending_email"] != "" || len(emails) != 0 {
 		t.Fatal("registration must store email unverified without sending", body)
 	}
@@ -307,7 +396,13 @@ func TestAuthenticationFlow(t *testing.T) {
 		}
 		status, body = post("login", map[string]string{"phone": "+923081234567", "password": credentials["password"]})
 		expect(t, status, 200, body)
-		status, body = verify(body["access_token"].(string), code)
+		otherAccess := body["access_token"].(string)
+		status, body = call(http.MethodGet, "me/driver-submission", otherAccess, nil)
+		expect(t, status, 200, body)
+		if body["status"] != "not_submitted" {
+			t.Fatal("another account's submission was exposed", body)
+		}
+		status, body = verify(otherAccess, code)
 		expect(t, status, 400, body)
 		if _, err := isolated.Exec(ctx, `UPDATE auth_email_challenges SET expires_at=now()-interval '1 second' WHERE user_id=$1`, id); err != nil {
 			t.Fatal(err)

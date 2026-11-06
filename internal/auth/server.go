@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"crypto/cipher"
 	"encoding/json"
 	"errors"
 	"io"
@@ -32,23 +33,27 @@ type SMS interface {
 }
 
 type Config struct {
+	DriverDocumentKey              []byte
 	EmailSender                    EmailSender
 	OTPKey                         []byte
 	PasswordMemory, PasswordPasses uint32
 }
 
 type Server struct {
-	emailSender     EmailSender
-	db              *pgxpool.Pool
-	sms             SMS
-	passwords       passwords
-	otpKey          []byte
-	dummyHash       string
-	hashSlots       chan struct{}
-	deliveryContext context.Context
-	smsSlots        chan struct{}
-	cancel          context.CancelFunc
-	worker          sync.WaitGroup
+	driverDocumentCipher cipher.AEAD
+	driverDocumentSlots  chan struct{}
+	driverUploadSlots    chan struct{}
+	emailSender          EmailSender
+	db                   *pgxpool.Pool
+	sms                  SMS
+	passwords            passwords
+	otpKey               []byte
+	dummyHash            string
+	hashSlots            chan struct{}
+	deliveryContext      context.Context
+	smsSlots             chan struct{}
+	cancel               context.CancelFunc
+	worker               sync.WaitGroup
 }
 
 type delivery struct {
@@ -69,6 +74,13 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{db: db, sms: sms, emailSender: cfg.EmailSender, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
 		hashSlots: make(chan struct{}, 2), deliveryContext: ctx, smsSlots: make(chan struct{}, 32), cancel: cancel}
+	s.driverDocumentCipher, err = newDriverDocumentCipher(cfg.DriverDocumentKey)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	s.driverDocumentSlots = make(chan struct{}, 2)
+	s.driverUploadSlots = make(chan struct{}, 4)
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
 }
@@ -101,6 +113,7 @@ func (s *Server) cleanup(ctx context.Context) {
 		for _, statement := range []string{
 			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
 			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
+			purgeSupersededDriverDocuments,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
@@ -121,15 +134,16 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone     string       `json:"phone"`
-	Password  string       `json:"password"`
-	Name      string       `json:"name"`
-	Email     string       `json:"email"`
-	Challenge string       `json:"challenge"`
-	Code      string       `json:"code"`
-	Refresh   string       `json:"refresh_token"`
-	Recovery  string       `json:"recovery_token"`
-	Profile   profilePatch `json:"-"`
+	Phone            string                `json:"phone"`
+	Password         string                `json:"password"`
+	Name             string                `json:"name"`
+	Email            string                `json:"email"`
+	Challenge        string                `json:"challenge"`
+	Code             string                `json:"code"`
+	Refresh          string                `json:"refresh_token"`
+	Recovery         string                `json:"recovery_token"`
+	Profile          profilePatch          `json:"-"`
+	DriverSubmission driverSubmissionInput `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -149,6 +163,8 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "PATCH", "me", s.updateProfile)
 	s.route(mux, "POST", "me/email/request", s.requestEmailVerification)
 	s.route(mux, "POST", "me/email/verify", s.verifyEmail)
+	s.route(mux, "GET", "me/driver-submission", s.driverSubmission)
+	s.route(mux, "POST", "me/driver-submission", s.submitDriverIdentity)
 	return mux
 }
 
@@ -163,7 +179,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			peer = r.RemoteAddr
 		}
 		limit := 60
-		if path == "auth/register" || path == "auth/recovery/request" {
+		if path == "auth/register" || path == "auth/recovery/request" || path == "me/driver-submission" {
 			limit = 10
 		}
 		if err := allow(ctx, s.db, path+"/ip/"+peer, time.Minute, limit); err != nil {
@@ -171,19 +187,55 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			return
 		}
 		var body input
+		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
-			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 4096))
-			decoder.DisallowUnknownFields()
+			var maxBytes int64 = 4096
 			var target any = &body
 			if method == http.MethodPatch {
 				target = &body.Profile
 			}
-			if err := decoder.Decode(target); err != nil || decoder.Decode(new(any)) != io.EOF {
+			if path == "me/driver-submission" {
+				if _, _, err := s.me(ctx, input{}, bearer); err != nil {
+					respond(w, 0, nil, err)
+					return
+				}
+				maxBytes = 3 * 1024 * 1024
+				if r.ContentLength > maxBytes {
+					respond(w, 0, nil, documentTooLarge)
+					return
+				}
+				target = &body.DriverSubmission
+				select {
+				case s.driverUploadSlots <- struct{}{}:
+					defer func() { <-s.driverUploadSlots }()
+				default:
+					respond(w, 0, nil, busy)
+					return
+				}
+				// Limit how long a stalled client can hold an upload slot.
+				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Second))
+			}
+			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
+			decoder.DisallowUnknownFields()
+			decodeErr := decoder.Decode(target)
+			if decodeErr == nil {
+				decodeErr = decoder.Decode(new(any))
+				if decodeErr == io.EOF {
+					decodeErr = nil
+				} else if decodeErr == nil {
+					decodeErr = invalid
+				}
+			}
+			if decodeErr != nil {
+				var oversized *http.MaxBytesError
+				if errors.As(decodeErr, &oversized) && path == "me/driver-submission" {
+					respond(w, 0, nil, documentTooLarge)
+					return
+				}
 				respond(w, 0, nil, invalid)
 				return
 			}
 		}
-		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		status, result, err := run(ctx, body, bearer)
 		if path != "me" {
 			slog.Info("auth_request", "operation", path, "outcome", outcome(err))
@@ -196,7 +248,7 @@ func outcome(err error) string {
 	switch err {
 	case nil:
 		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota:
 		return err.Error()
 	default:
 		return "internal_error"
@@ -206,8 +258,12 @@ func outcome(err error) string {
 func respond(w http.ResponseWriter, status int, result any, err error) {
 	if err != nil {
 		switch err {
-		case invalid, invalidCode, invalidRecovery:
+		case invalid, invalidCode, invalidRecovery, invalidDocument:
 			status = 400
+		case documentTooLarge:
+			status = 413
+		case documentQuota:
+			status = 409
 		case denied, unauthorized:
 			status = 401
 		case limited:
