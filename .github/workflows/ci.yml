@@ -1,0 +1,42 @@
+name: Backend CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Go and PostgreSQL
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      HIGO_TEST_DATABASE_URL: postgres://higo:local_higo_only@127.0.0.1:5432/higo?sslmode=disable
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.26.5'
+      - name: Start PostgreSQL from Compose
+        run: docker compose up -d --wait postgres
+      - name: Test against PostgreSQL
+        run: go test -race -count=1 -v ./...
+      - name: Vet Go
+        run: go vet ./...
+      - name: Build API image
+        run: docker build -t higo-api:ci .
+      - name: Smoke test API image
+        env:
+          DATABASE_URL: postgres://higo:local_higo_only@127.0.0.1:5432/higo?sslmode=disable
+          HIGO_ENV: development
+        run: |
+          export HIGO_OTP_KEY="$(openssl rand -base64 32)"
+          docker run --detach --name higo-api-ci --network host \
+            --env DATABASE_URL --env HIGO_ENV --env HIGO_OTP_KEY higo-api:ci
+          curl --fail --silent --show-error --retry 15 --retry-connrefused \
+            --retry-delay 1 http://127.0.0.1:8080/healthz
