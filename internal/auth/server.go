@@ -120,6 +120,7 @@ func (s *Server) cleanup(ctx context.Context) {
 			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
 			purgeSupersededDriverDocuments,
 			purgeSupersededVehicleDocuments,
+			purgeAbandonedOnboardingDocuments,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
@@ -140,17 +141,19 @@ func (s *Server) cleanup(ctx context.Context) {
 }
 
 type input struct {
-	Phone             string                 `json:"phone"`
-	Password          string                 `json:"password"`
-	Name              string                 `json:"name"`
-	Email             string                 `json:"email"`
-	Challenge         string                 `json:"challenge"`
-	Code              string                 `json:"code"`
-	Refresh           string                 `json:"refresh_token"`
-	Recovery          string                 `json:"recovery_token"`
-	Profile           profilePatch           `json:"-"`
-	DriverSubmission  driverSubmissionInput  `json:"-"`
-	VehicleSubmission vehicleSubmissionInput `json:"-"`
+	Phone              string                     `json:"phone"`
+	Password           string                     `json:"password"`
+	Name               string                     `json:"name"`
+	Email              string                     `json:"email"`
+	Challenge          string                     `json:"challenge"`
+	Code               string                     `json:"code"`
+	Refresh            string                     `json:"refresh_token"`
+	Recovery           string                     `json:"recovery_token"`
+	Profile            profilePatch               `json:"-"`
+	OnboardingDraft    map[string]string          `json:"-"`
+	OnboardingIdentity onboardingDocuments        `json:"-"`
+	OnboardingVehicle  onboardingVehicleDocuments `json:"-"`
+	OnboardingSubmit   onboardingSubmission       `json:"-"`
 }
 
 type operation func(context.Context, input, string) (int, any, error)
@@ -170,10 +173,11 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "PATCH", "me", s.updateProfile)
 	s.route(mux, "POST", "me/email/request", s.requestEmailVerification)
 	s.route(mux, "POST", "me/email/verify", s.verifyEmail)
-	s.route(mux, "GET", "me/driver-submission", s.driverSubmission)
-	s.route(mux, "POST", "me/driver-submission", s.submitDriverIdentity)
-	s.route(mux, "GET", "me/vehicles", s.vehicles)
-	s.route(mux, "POST", "me/vehicles", s.submitVehicle)
+	s.route(mux, "GET", onboardingPath, s.getOnboarding)
+	s.route(mux, "PATCH", onboardingPath, s.saveOnboarding)
+	s.route(mux, "POST", onboardingPath, s.submitOnboarding)
+	s.route(mux, "POST", onboardingPath+"/identity-documents", s.saveOnboardingIdentity)
+	s.route(mux, "POST", onboardingPath+"/vehicle-documents", s.saveOnboardingVehicle)
 	return mux
 }
 
@@ -181,7 +185,7 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 	mux.HandleFunc(method+" /api/v1/"+path, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Content-Type", "application/json")
-		vehicleUpload := method == http.MethodPost && path == "me/vehicles"
+		vehicleUpload := method == http.MethodPost && path == onboardingPath+"/vehicle-documents"
 		requestTimeout := 10 * time.Second
 		if vehicleUpload {
 			requestTimeout = 25 * time.Second
@@ -194,12 +198,12 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			peer = r.RemoteAddr
 		}
 		limit := 60
-		documentUpload := method == http.MethodPost && (path == "me/driver-submission" || path == "me/vehicles")
+		documentUpload := method == http.MethodPost && (path == onboardingPath+"/identity-documents" || path == onboardingPath+"/vehicle-documents")
 		if path == "auth/register" || path == "auth/recovery/request" || documentUpload {
 			limit = 10
 		}
 		ratePath := path
-		if path == "me/driver-submission" || path == "me/vehicles" {
+		if documentUpload {
 			ratePath = method + "/" + path
 		}
 		if err := allow(ctx, s.db, ratePath+"/ip/"+peer, time.Minute, limit); err != nil {
@@ -216,6 +220,12 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 			var target any = &body
 			if method == http.MethodPatch {
 				target = &body.Profile
+			}
+			if path == onboardingPath {
+				target = &body.OnboardingSubmit
+				if method == http.MethodPatch {
+					target = &body.OnboardingDraft
+				}
 			}
 			if documentUpload {
 				_, account, err := s.me(ctx, input{}, bearer)
@@ -235,10 +245,10 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 					return
 				}
 				maxBytes = 3 * 1024 * 1024
-				target = &body.DriverSubmission
-				if path == "me/vehicles" {
+				target = &body.OnboardingIdentity
+				if path == onboardingPath+"/vehicle-documents" {
 					maxBytes = 6 * 1024 * 1024
-					target = &body.VehicleSubmission
+					target = &body.OnboardingVehicle
 				}
 				if r.ContentLength > maxBytes {
 					respond(w, 0, nil, documentTooLarge)
@@ -319,7 +329,7 @@ func outcome(err error) string {
 	switch err {
 	case nil:
 		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota, identityRequired, vehicleNotFound, uploadTimeout:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, onboardingConflict, onboardingIncomplete, uploadTimeout:
 		return err.Error()
 	default:
 		return "internal_error"
@@ -333,10 +343,8 @@ func respond(w http.ResponseWriter, status int, result any, err error) {
 			status = 400
 		case documentTooLarge:
 			status = 413
-		case documentQuota, identityRequired:
+		case onboardingConflict, onboardingIncomplete:
 			status = 409
-		case vehicleNotFound:
-			status = 404
 		case uploadTimeout:
 			status = 408
 		case denied, unauthorized:
