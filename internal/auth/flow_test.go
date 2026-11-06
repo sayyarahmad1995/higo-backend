@@ -722,114 +722,133 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, status, 202, body)
 	})
 
-	t.Run("application submission binds exact owned versions and reflects both checks", func(t *testing.T) {
+	t.Run("application drafts resume and final submission binds exact owned versions", func(t *testing.T) {
 		status, body := post("login", credentials)
 		expect(t, status, 200, body)
 		owner := body["access_token"].(string)
-		otherPhone := "+923061234567"
-		status, body = post("login", map[string]string{"phone": otherPhone, "password": oldPassword})
+		status, body = call(http.MethodGet, "me", owner, nil)
 		expect(t, status, 200, body)
-		other := body["access_token"].(string)
+		beforeCapabilities, _ := json.Marshal(body["capabilities"])
 		const path = "me/driver-application"
-		status, body = call(http.MethodPatch, path, owner, map[string]string{"legal_name": "Draft Driver", "step": "1"})
-		expect(t, status, 200, body)
 		status, body = call(http.MethodGet, path, owner, nil)
 		expect(t, status, 200, body)
-		if body["status"] != "draft" || body["draft"].(map[string]any)["legal_name"] != "Draft Driver" {
+		if body["status"] != "draft" || body["draft"].(map[string]any)["revision"] != "0" {
 			t.Fatal(body)
 		}
+		fields := map[string]string{"revision": "0", "step": "2", "legal_name": "Draft Driver", "vehicle_id": vehicleID,
+			"make": "Test", "model": "Car", "manufacture_year": "2020", "color": "Black", "registration_number": "ABC-123"}
+		results := make(chan response, 2)
+		for range 2 {
+			go func() {
+				status, body := call(http.MethodPatch, path, owner, fields)
+				results <- response{status, body}
+			}()
+		}
+		a, b := <-results, <-results
+		if !((a.status == 200 && b.status == 409) || (a.status == 409 && b.status == 200)) {
+			t.Fatalf("concurrent draft writes: %v %v", a, b)
+		}
+		status, body = post("login", credentials)
+		expect(t, status, 200, body)
+		owner = body["access_token"].(string)
+		status, body = call(http.MethodGet, path, owner, nil)
+		expect(t, status, 200, body)
+		if draft := body["draft"].(map[string]any); draft["legal_name"] != fields["legal_name"] || draft["revision"] != "1" {
+			t.Fatal(body)
+		}
+		status, body = post("login", map[string]string{"phone": "+923061234567", "password": oldPassword})
+		expect(t, status, 200, body)
+		other := body["access_token"].(string)
 		status, body = call(http.MethodGet, path, other, nil)
 		expect(t, status, 200, body)
-		if len(body["draft"].(map[string]any)) != 0 {
+		if draft := body["draft"].(map[string]any); len(draft) != 1 || draft["revision"] != "0" {
 			t.Fatal("another account's draft leaked", body)
+		}
+		binding := map[string]any{"identity_version": 5, "vehicle_id": vehicleID, "vehicle_version": 4, "draft_revision": "1"}
+		status, body = call(http.MethodPost, path, owner, binding)
+		expect(t, status, 409, body)
+		var picture bytes.Buffer
+		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
+			t.Fatal(err)
+		}
+		identity := map[string]any{"legal_name": fields["legal_name"], "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes(), "draft_revision": "1"}
+		status, body = call(http.MethodPost, "me/driver-submission", owner, identity)
+		expect(t, status, 201, body)
+		if draft := body["application_draft"].(map[string]any); draft["identity_version"] != "5" || draft["revision"] != "2" {
+			t.Fatal(body)
+		}
+		status, body = call(http.MethodPost, "me/driver-submission", owner, identity)
+		expect(t, status, 409, body)
+		vehicle := map[string]any{"vehicle_id": vehicleID, "make": "Test", "model": "Car", "manufacture_year": "2020", "color": "Black",
+			"registration_number": "ABC-123", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes(), "draft_revision": "2"}
+		status, body = call(http.MethodPost, "me/vehicles", owner, vehicle)
+		expect(t, status, 201, body)
+		if draft := body["application_draft"].(map[string]any); draft["vehicle_version"] != "4" || draft["revision"] != "3" {
+			t.Fatal(body)
+		}
+		status, body = call(http.MethodGet, path, owner, nil)
+		expect(t, status, 200, body)
+		if draft := body["draft"].(map[string]any); body["status"] != "draft" || draft["identity_version"] != "5" || draft["vehicle_version"] != "4" {
+			t.Fatal(body)
 		}
 		var applications int
 		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM driver_applications`).Scan(&applications); err != nil || applications != 0 {
-			t.Fatalf("upload entered review: %d %v", applications, err)
+			t.Fatalf("draft entered review: %d %v", applications, err)
 		}
-		binding := map[string]any{"identity_version": 4, "vehicle_id": vehicleID, "vehicle_version": 3}
+		binding["draft_revision"] = "3"
 		status, body = call(http.MethodPost, path, other, binding)
 		expect(t, status, 409, body)
-		binding["identity_version"] = 3
-		status, body = call(http.MethodPost, path, owner, binding)
-		expect(t, status, 409, body)
-		binding["identity_version"] = 4
-		results := make(chan response, 2)
 		for range 2 {
 			go func() {
 				status, body := call(http.MethodPost, path, owner, binding)
 				results <- response{status, body}
 			}()
 		}
+		var applicationID any
 		for range 2 {
 			result := <-results
 			expect(t, result.status, 200, result.body)
 			if result.body["status"] != "under_review" || result.body["draft"].(map[string]any)["step"] != nil {
 				t.Fatal(result.body)
 			}
+			if applicationID != nil && applicationID != result.body["id"] {
+				t.Fatal("duplicate application")
+			}
+			applicationID = result.body["id"]
 		}
-		var id int64
-		if err := isolated.QueryRow(ctx, `SELECT id FROM driver_applications`).Scan(&id); err != nil {
+		if _, err := isolated.Exec(ctx, `UPDATE driver_applications SET status='rejected',resolved_at=now(),reason='Replace the vehicle image'`); err != nil {
 			t.Fatal(err)
 		}
-		if err := isolated.QueryRow(ctx, `SELECT count(*) FROM driver_applications`).Scan(&applications); err != nil || applications != 1 {
-			t.Fatalf("final submission duplicated: %d %v", applications, err)
-		}
-		check := func(kind, decision, reason string) {
-			t.Helper()
-			if _, err := isolated.Exec(ctx, `INSERT INTO driver_application_checks(application_id,kind,decision,reason,reviewer_id)
- SELECT $1,$2,$3,$4,id FROM auth_users WHERE phone=$5`, id, kind, decision, reason, otherPhone); err != nil {
-				t.Fatal(err)
-			}
-		}
-		check("identity", "approved", "")
-		status, body = call(http.MethodGet, path, owner, nil)
-		expect(t, status, 200, body)
-		if body["status"] != "under_review" {
-			t.Fatal(body)
-		}
-		check("vehicle", "rejected", "Replace the vehicle image")
 		status, body = call(http.MethodGet, path, owner, nil)
 		expect(t, status, 200, body)
 		if body["status"] != "rejected" || body["reason"] != "Replace the vehicle image" {
 			t.Fatal(body)
 		}
-		var picture bytes.Buffer
-		if err := png.Encode(&picture, image.NewRGBA(image.Rect(0, 0, 2, 2))); err != nil {
-			t.Fatal(err)
-		}
-		status, body = call(http.MethodPost, "me/driver-submission", owner, map[string]any{"legal_name": "Revised Driver", "cnic_front": picture.Bytes(), "cnic_back": picture.Bytes()})
+		fields["revision"], fields["color"], fields["identity_version"] = "4", "Blue", "5"
+		status, body = call(http.MethodPatch, path, owner, fields)
+		expect(t, status, 200, body)
+		vehicle["draft_revision"] = "5"
+		vehicle["color"] = "Blue"
+		status, body = call(http.MethodPost, "me/vehicles", owner, vehicle)
 		expect(t, status, 201, body)
-		binding["identity_version"] = 5
 		status, body = call(http.MethodPost, path, owner, binding)
-		expect(t, status, 409, body) // Revising identity cannot requeue a rejected vehicle version.
-		status, body = call(http.MethodPost, "me/vehicles", owner, map[string]any{"vehicle_id": vehicleID, "make": "Test", "model": "Car", "manufacture_year": "2020", "color": "Black", "registration_number": "ABC-123", "registration_image": picture.Bytes(), "insurance_image": picture.Bytes()})
-		expect(t, status, 201, body)
-		binding["vehicle_version"] = body["version"]
+		expect(t, status, 409, body)
+		binding["draft_revision"] = "6"
+		binding["vehicle_version"] = 5
 		status, body = call(http.MethodPost, path, owner, binding)
 		expect(t, status, 200, body)
-		if body["status"] != "under_review" {
+		if body["status"] != "under_review" || body["id"] == applicationID || body["reason"] != nil {
 			t.Fatal(body)
 		}
-		if err := isolated.QueryRow(ctx, `SELECT id FROM current_driver_applications`).Scan(&id); err != nil {
-			t.Fatal(err)
-		}
-		check("vehicle", "approved", "")
-		status, body = call(http.MethodGet, path, owner, nil)
-		expect(t, status, 200, body)
-		if body["status"] != "under_review" {
-			t.Fatal("new application inherited old identity approval", body)
-		}
-		check("identity", "approved", "")
-		status, body = call(http.MethodGet, path, owner, nil)
-		expect(t, status, 200, body)
-		if body["status"] != "approved" {
-			t.Fatal(body)
+		var originalColor string
+		if err := isolated.QueryRow(ctx, `SELECT color FROM driver_vehicle_submissions WHERE vehicle_id=$1::text::bigint AND version=4`, vehicleID).Scan(&originalColor); err != nil || originalColor != "Black" {
+			t.Fatalf("submitted vehicle changed: %q %v", originalColor, err)
 		}
 		status, body = call(http.MethodGet, "me", owner, nil)
 		expect(t, status, 200, body)
-		if caps := body["capabilities"].([]any); len(caps) != 1 || caps[0] != "rider" {
-			t.Fatal("approval granted membership", body)
+		afterCapabilities, _ := json.Marshal(body["capabilities"])
+		if !bytes.Equal(beforeCapabilities, afterCapabilities) {
+			t.Fatal("application changed membership", body)
 		}
 	})
 }

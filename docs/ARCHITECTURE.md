@@ -28,10 +28,10 @@ Native authentication → account/capabilities → Driver onboarding/vehicles �
 
 ## Administrative service boundary
 
-HiGO Core serves Rider and Driver APIs and owns PostgreSQL migrations, applicant draft and version writes, and the derived current application state. The separately deployed [HiGO Admin Operations service](https://github.com/sayyarahmad1995/higo-admin-operations) serves its own Go API and same-origin SPA. Core has no administrative HTTP surface.
+HiGO Core owns Rider and Driver APIs, PostgreSQL migrations, applicant drafts, encrypted evidence, and application state. Administrative review belongs to a separate future service. Core serves no administrative routes or assets.
 
-Admin authenticates designated reviewers through Core's ordinary account authentication and checks the database reviewer grant and active session on every privileged operation. A trusted operator provisions or revokes the grant. Admin uses a separate database identity with narrow read and insert privileges. It has no access to password hashes or unrestricted session data. The Core-owned reviewer lock function serializes administrative actions against applicant changes. PostgreSQL stores check decisions and document-access audit entries. Core derives application status from that state.
+An application stores its applicant, immutable identity and vehicle version references, submission time, and review state. Any future decision must target the exact current application under the same account lock used by uploads and final submission. Approval must require every mandatory check. Decisions, reviewer access, and document disclosure are outside this slice.
 
-Core encrypts uploaded evidence. Admin receives the same separately managed document key so it can decrypt authorized reads. Before production, validate key identifiers, rotation and backup recovery, expiry and restore behavior, reviewer provisioning and revocation, audit monitoring, and the isolated HTTPS deployment.
+Before production, validate document key versioning, rotation and recovery, retention and backup expiry, and physical-device document selection. Existing authentication and deployment gates remain separate.
 
 Shared functionality is introduced by the first slice that needs it, not by speculative up-front architecture.

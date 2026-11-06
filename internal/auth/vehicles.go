@@ -13,7 +13,7 @@ import (
 )
 
 const maxVehicleDocument = 2 * 1024 * 1024
-const vehicleColumns = `vehicle_id,version,make,model,manufacture_year,color,registration_number,status,submitted_at,rejection_reason`
+const vehicleColumns = `vehicle_id,version,make,model,manufacture_year,color,registration_number,status,submitted_at`
 const purgeSupersededVehicleDocuments = `UPDATE driver_vehicle_submissions v SET registration_image=NULL,insurance_image=NULL
  WHERE (v.user_id,v.vehicle_id,v.version) IN (SELECT old.user_id,old.vehicle_id,old.version FROM driver_vehicle_submissions old
  WHERE old.registration_image IS NOT NULL AND old.submitted_at<now()-interval '30 days'
@@ -35,24 +35,25 @@ type vehicleSubmissionInput struct {
 	Registration      string `json:"registration_number"`
 	RegistrationImage []byte `json:"registration_image"`
 	InsuranceImage    []byte `json:"insurance_image"`
+	DraftRevision     string `json:"draft_revision"`
 }
 
 type vehicleSubmission struct {
-	VehicleID       int64     `json:"vehicle_id"`
-	Version         int       `json:"version"`
-	Make            string    `json:"make"`
-	Model           string    `json:"model"`
-	Year            int       `json:"manufacture_year"`
-	Color           string    `json:"color"`
-	Registration    string    `json:"registration_number"`
-	Status          string    `json:"status"`
-	SubmittedAt     time.Time `json:"submitted_at"`
-	RejectionReason string    `json:"rejection_reason,omitempty"`
+	VehicleID        int64             `json:"vehicle_id"`
+	Version          int               `json:"version"`
+	Make             string            `json:"make"`
+	Model            string            `json:"model"`
+	Year             int               `json:"manufacture_year"`
+	Color            string            `json:"color"`
+	Registration     string            `json:"registration_number"`
+	Status           string            `json:"status"`
+	SubmittedAt      time.Time         `json:"submitted_at"`
+	ApplicationDraft map[string]string `json:"application_draft,omitempty"`
 }
 
 func scanVehicle(row pgx.Row) (vehicleSubmission, error) {
 	var v vehicleSubmission
-	err := row.Scan(&v.VehicleID, &v.Version, &v.Make, &v.Model, &v.Year, &v.Color, &v.Registration, &v.Status, &v.SubmittedAt, &v.RejectionReason)
+	err := row.Scan(&v.VehicleID, &v.Version, &v.Make, &v.Model, &v.Year, &v.Color, &v.Registration, &v.Status, &v.SubmittedAt)
 	return v, err
 }
 
@@ -117,6 +118,16 @@ func (s *Server) submitVehicle(ctx context.Context, body input, bearer string) (
 		if err != nil {
 			return err
 		}
+		var draft map[string]string
+		if f.DraftRevision != "" {
+			draft, err = matchDraft(ctx, tx, id, f.DraftRevision, map[string]string{
+				"make": v.Make, "model": v.Model, "color": v.Color, "registration_number": v.Registration,
+				"manufacture_year": f.Year, "vehicle_id": f.VehicleID,
+			})
+			if err != nil {
+				return err
+			}
+		}
 		var exists bool
 		if err := tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM driver_identity_submissions WHERE user_id=$1)`, id).Scan(&exists); err != nil {
 			return err
@@ -151,7 +162,15 @@ func (s *Server) submitVehicle(ctx context.Context, body input, bearer string) (
 		v, err = scanVehicle(tx.QueryRow(ctx, `INSERT INTO driver_vehicle_submissions(user_id,vehicle_id,version,make,model,manufacture_year,color,registration_number,registration_image,insurance_image)
  VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING `+vehicleColumns, id, v.VehicleID, v.Version, v.Make, v.Model, v.Year, v.Color, v.Registration,
 			s.driverDocumentCipher.Seal(nil, nil, registration, []byte(associated+"registration")), s.driverDocumentCipher.Seal(nil, nil, insurance, []byte(associated+"insurance"))))
-		return err
+		if err != nil || draft == nil {
+			return err
+		}
+		draft["vehicle_id"] = strconv.FormatInt(v.VehicleID, 10)
+		draft["vehicle_version"] = strconv.Itoa(v.Version)
+		draft["registration_number"] = v.Registration
+		draft["manufacture_year"] = strconv.Itoa(v.Year)
+		v.ApplicationDraft = draft
+		return writeApplicationDraft(ctx, tx, id, draft)
 	})
 	return 201, v, err
 }

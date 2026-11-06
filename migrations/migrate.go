@@ -26,10 +26,7 @@ var driverDocumentLimits string
 //go:embed 006_vehicle_submissions.sql
 var vehicleSubmissions string
 
-//go:embed 007_onboarding_review.sql
-var onboardingReview string
-
-//go:embed 008_driver_applications.sql
+//go:embed 007_driver_applications.sql
 var driverApplications string
 
 // Apply serializes migration runners and commits each schema change with its version.
@@ -41,7 +38,7 @@ func Apply(ctx context.Context, db *pgxpool.Pool) error {
 		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version integer PRIMARY KEY)`); err != nil {
 			return err
 		}
-		for i, schema := range []string{authSchema, accountCapabilities, emailVerification, driverSubmissions, driverDocumentLimits, vehicleSubmissions, onboardingReview, driverApplications} {
+		for i, schema := range []string{authSchema, accountCapabilities, emailVerification, driverSubmissions, driverDocumentLimits, vehicleSubmissions, driverApplications} {
 			version := i + 1
 			var applied bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&applied); err != nil {
