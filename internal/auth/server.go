@@ -42,6 +42,7 @@ type Config struct {
 type Server struct {
 	driverDocumentCipher cipher.AEAD
 	driverDocumentSlots  chan struct{}
+	driverUploadSlots    chan struct{}
 	emailSender          EmailSender
 	db                   *pgxpool.Pool
 	sms                  SMS
@@ -79,6 +80,7 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 		return nil, err
 	}
 	s.driverDocumentSlots = make(chan struct{}, 2)
+	s.driverUploadSlots = make(chan struct{}, 4)
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
 }
@@ -111,6 +113,7 @@ func (s *Server) cleanup(ctx context.Context) {
 		for _, statement := range []string{
 			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
 			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
+			purgeSupersededDriverDocuments,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
@@ -198,10 +201,33 @@ func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
 				}
 				maxBytes = 3 * 1024 * 1024
 				target = &body.DriverSubmission
+				select {
+				case s.driverUploadSlots <- struct{}{}:
+					defer func() { <-s.driverUploadSlots }()
+				default:
+					respond(w, 0, nil, busy)
+					return
+				}
+				// Limit how long a stalled client can hold an upload slot.
+				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(5 * time.Second))
 			}
 			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 			decoder.DisallowUnknownFields()
-			if err := decoder.Decode(target); err != nil || decoder.Decode(new(any)) != io.EOF {
+			decodeErr := decoder.Decode(target)
+			if decodeErr == nil {
+				decodeErr = decoder.Decode(new(any))
+				if decodeErr == io.EOF {
+					decodeErr = nil
+				} else if decodeErr == nil {
+					decodeErr = invalid
+				}
+			}
+			if decodeErr != nil {
+				var oversized *http.MaxBytesError
+				if errors.As(decodeErr, &oversized) && path == "me/driver-submission" {
+					respond(w, 0, nil, documentTooLarge)
+					return
+				}
 				respond(w, 0, nil, invalid)
 				return
 			}
@@ -218,7 +244,7 @@ func outcome(err error) string {
 	switch err {
 	case nil:
 		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, documentQuota:
 		return err.Error()
 	default:
 		return "internal_error"
@@ -228,8 +254,12 @@ func outcome(err error) string {
 func respond(w http.ResponseWriter, status int, result any, err error) {
 	if err != nil {
 		switch err {
-		case invalid, invalidCode, invalidRecovery:
+		case invalid, invalidCode, invalidRecovery, invalidDocument:
 			status = 400
+		case documentTooLarge:
+			status = 413
+		case documentQuota:
+			status = 409
 		case denied, unauthorized:
 			status = 401
 		case limited:

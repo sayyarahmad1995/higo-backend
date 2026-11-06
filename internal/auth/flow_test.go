@@ -230,6 +230,34 @@ func TestAuthenticationFlow(t *testing.T) {
 		if capabilities := body["capabilities"].([]any); len(capabilities) != 1 || capabilities[0] != "rider" {
 			t.Fatal("submission changed membership", body)
 		}
+		previousPeer := peer
+		peer = "192.0.2.99:12345"
+		defer func() { peer = previousPeer }()
+		payload["cnic_front"] = make([]byte, maxDriverImage+1)
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 413, body)
+		if body["error"] != "document_too_large" {
+			t.Fatal(body)
+		}
+		if _, err := isolated.Exec(ctx, `UPDATE driver_identity_submissions SET submitted_at=now()-interval '31 days'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, purgeSupersededDriverDocuments); err != nil {
+			t.Fatal(err)
+		}
+		var versionsLeft, imagesLeft int
+		if err := isolated.QueryRow(ctx, `SELECT count(*),count(cnic_front) FROM driver_identity_submissions`).Scan(&versionsLeft, &imagesLeft); err != nil {
+			t.Fatal(err)
+		}
+		if versionsLeft != 4 || imagesLeft != 1 {
+			t.Fatalf("cleanup kept %d versions and %d document pairs", versionsLeft, imagesLeft)
+		}
+		payload["cnic_back"] = make([]byte, 2*maxDriverImage)
+		status, body = call(http.MethodPost, "me/driver-submission", access, payload)
+		expect(t, status, 413, body)
+		if body["error"] != "document_too_large" {
+			t.Fatal(body)
+		}
 	})
 	if body["email"] != "signup@example.test" || body["email_verified"] != false || body["pending_email"] != "" || len(emails) != 0 {
 		t.Fatal("registration must store email unverified without sending", body)
