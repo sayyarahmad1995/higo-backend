@@ -1,32 +1,45 @@
-# Native Authentication Contract
+# Native authentication
 
-## Decision
+Flutter calls the Go API. PostgreSQL owns verified accounts, purpose-bound challenges, password credentials, recovery grants, and sessions.
 
-Implement native phone authentication inside the HiGO Go backend. **No Kratos or GoTrue runtime dependency**. The Flutter app calls only HiGO's HTTP APIs. No external provider API is exposed to the client.
+On the welcome screen, Get Started opens registration and Log In opens password sign-in. This replaces the prototype's simulated account lookup. Registration collects name, optional email, and password before sending a verification code. A verified registration returns a session. Forgot Password requests and verifies a recovery code, then accepts a new password and returns to the login screen. No public lookup reveals whether a phone is registered.
 
-## Required flows
+## HTTP API
 
-1. **Registration:** E.164 phone number, password, SMS verification challenge, and account creation/activation with verified phone. Prevent duplicate/ambiguous accounts and partial states.
-2. **Normal sign-in:** Phone + password. No SMS challenge. Unknown phone and wrong password have identical external failure semantics. No public phone-existence lookup.
-3. **Recovery:** Request SMS OTP for an existing phone; avoid disclosing whether it exists. Consume an OTP restricted to the recovery purpose, issue only a short-lived recovery credential, permit password change only, consume the credential and revoke sessions according to policy. Recovery OTP alone must not create a normal authenticated session.
-4. **Sessions:** Server-owned opaque, cryptographically random access and refresh tokens (subject to design validation), only token digests in storage, expiration, atomic refresh rotation, logout, and account-wide revocation. Flutter securely stores its credentials.
-5. **Current user and authorization:** Authenticated identity mapped to one HiGO account; business capabilities and permissions are separately enforced by each protected route.
+All paths below begin with `/api/v1`. POST requests with a body use JSON. Passwords are used as entered, with a 12–128 UTF-8 byte limit. The server requires an international number and validates it against numbering-plan metadata before storage.
 
-## Mandatory security properties
+| Method and path | Input | Success |
+| --- | --- | --- |
+| POST /auth/register | `phone`, `password`, `name`, optional `email` | 202 with `challenge`, `expires_in`, `resend_after` |
+| POST /auth/register/verify | `challenge`, six-digit `code` | 201 with session tokens |
+| POST /auth/login | `phone`, `password` | 200 with session tokens |
+| POST /auth/recovery/request | `phone` | 202 with the same challenge shape for known and unknown phones |
+| POST /auth/recovery/verify | `challenge`, six-digit `code` | 200 with `recovery_token` and `expires_in` |
+| POST /auth/recovery/reset | `recovery_token`, new `password` | 204 |
+| POST /auth/refresh | `refresh_token` | 200 with replacement session tokens |
+| POST /auth/logout | Access bearer | 204 |
+| GET /me | Access bearer | 200 with `id`, `phone`, `name`, `email`, `capabilities` |
 
-- Use an established Argon2id implementation with unique salts and bounded cost parameters; never store plaintext passwords.
-- Generate secrets with a cryptographically secure random source.
-- OTP challenges are purpose-bound, short-lived, single-use, attempt-limited, rate-limited, and consumed atomically; test concurrent verification.
-- Rate limit login, registration, OTP issuance, and recovery at appropriate dimensions; prevent SMS abuse.
-- Use generic external authentication/recovery responses and do not expose secrets in logs or errors.
-- Protect sessions from refresh replay and concurrent rotation, and revoke sessions upon security-sensitive changes.
-- TLS, configuration validation, safe secret management, audit events, and appropriate API request limits are required before production use.
-- Validate both unit and real-PostgreSQL integration behavior; include adversarial tests for enumeration, replay, races, expiry, and cross-account privilege misuse.
+Session responses include `access_token`, `refresh_token`, and `expires_in` in seconds. Errors are JSON with an `error` code. Invalid and expired verification proofs return 400. Unknown phones and incorrect passwords return 401 with `invalid_credentials`. Invalid, expired, or revoked session tokens return 401. Throttling returns 429. A saturated password worker returns 503.
 
-## Scope boundary
+## Security behavior
 
-Initial implementation contains only phone/password/OTP/recovery/session flows. Social login, passkeys, enterprise federation, and speculative identity administration are out of scope.
+- An accepted issuance request returns 202 before SMS delivery. Repeat the original issuance request to resend after 60 seconds. Each issuance has its own challenge and code. Challenges expire in five minutes and allow five guesses. Only a challenge acknowledged by the SMS gateway can be verified. A failed send or process restart before acknowledgment requires a new issuance. Duplicate registration and unknown-phone recovery return an unusable challenge without sending SMS.
+- Challenges store keyed OTP digests. PostgreSQL consumes an OTP in the same transaction as account creation or recovery grant issuance. Registration creates the account only after successful verification. A unique phone constraint handles concurrent registration.
+- Argon2id uses a unique random salt, bounded encoded parameters, and configurable memory and passes. The default is 64 MiB and three passes. Unknown accounts use a dummy hash. Two concurrent hash operations are allowed per process.
+- Recovery credentials last ten minutes and authorize password reset only. Password reset consumes the credential, increments the password version, and revokes all sessions in one transaction. Older recovery grants and challenges cannot reset the changed password.
+- Access tokens expire after 15 minutes or at session expiry, whichever is earlier. Refresh sessions expire after 30 days from issuance. Rotation replaces access and refresh credentials atomically. Reuse of a consumed refresh token revokes that session. A client that loses a refresh response may need to sign in again.
+- Mobile keeps access tokens in memory and the refresh token in platform secure storage. It restores a session by refreshing and loading the current user. Concurrent refresh attempts are coalesced.
+- PostgreSQL limits requests by source peer and route. Login is capped at ten attempts per phone per 15-minute window. SMS issuance is capped at ten requests per peer and route per minute, five issuances per phone and purpose per hour, and 60 issuances per minute across the deployment. A rolling 60-second per-phone cooldown spans both SMS purposes. Cooldown rejections preserve the hourly budget. Each instance dispatches SMS independently with a bounded pool. Real and suppressed sends reserve capacity for the same interval. Exhausted capacity returns 503.
+- Only verified users get the default Rider capability. Driver and admin authorization belong to subsequent slices.
+- Logs contain operation and outcome codes without authentication secrets. The explicit loopback-only development SMS adapter prints codes to the local console.
 
-## Acceptance
+## Deployment and review
 
-Code and tests must demonstrate the exact user journey in the existing Flutter authentication screens. A two-day implementation goal is not a substitute for security review or production approval.
+Development acceptance covers integrated behavior, review, and green CI. Before enabling authentication for production users, complete these release checks:
+
+- Verify refresh persistence across a physical Android device restart and reauthentication after a lost refresh response.
+- Verify live Twilio delivery and provider failure behavior with the intended sender and destinations.
+- Validate the deployed containers, private backend listener, HTTPS ingress, and mobile connectivity. Configure PostgreSQL TLS when traffic leaves the host.
+- Measure enumeration signals and resource exhaustion under load. The app rate-limits by the immediate TCP peer, so validate proxy client-IP limits and the combined budget.
+- Complete an independent security review and production approval.
