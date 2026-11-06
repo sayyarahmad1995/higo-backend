@@ -437,6 +437,19 @@ func TestAuthenticationFlow(t *testing.T) {
 		}
 		status, body = call(http.MethodPost, "me/driver-application", otherAccess, map[string]string{"draft_revision": "5"})
 		expect(t, status, 409, body)
+		if _, err := isolated.Exec(ctx, `INSERT INTO driver_onboarding_applications(user_id,details,cnic_front,cnic_back,updated_at)
+ SELECT id,'{"step":"2","legal_name":"Other Applicant"}',decode('01','hex'),decode('01','hex'),now()-interval '31 days'
+ FROM auth_users WHERE phone='+923081234567'`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := isolated.Exec(ctx, purgeAbandonedOnboardingDocuments); err != nil {
+			t.Fatal(err)
+		}
+		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
+		expect(t, status, 200, body)
+		if draft := body["draft"].(map[string]any); draft["identity_saved"] != nil || draft["legal_name"] != "Other Applicant" || draft["revision"] != "2" {
+			t.Fatal("cleanup failed to expire evidence without deleting draft details", body)
+		}
 		status, body = verify(otherAccess, code)
 		expect(t, status, 400, body)
 		if _, err := isolated.Exec(ctx, `UPDATE auth_email_challenges SET expires_at=now()-interval '1 second' WHERE user_id=$1`, id); err != nil {
