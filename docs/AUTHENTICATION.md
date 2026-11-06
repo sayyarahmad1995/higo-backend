@@ -36,4 +36,10 @@ Session responses include `access_token`, `refresh_token`, and `expires_in` in s
 
 ## Deployment and review
 
-Use a private listener behind HTTPS ingress and configure PostgreSQL TLS when traffic leaves the host. The app uses the immediate TCP peer as its rate-limit address. When deploying behind a proxy, configure additional client-IP limits there and validate the combined budget. Verify Twilio delivery, sender registration, geography permissions, and expected failure rates before release. Validate rate limits and Argon2 resource use under load and complete an independent security review before production approval.
+Development acceptance covers integrated behavior, review, and green CI. Before enabling authentication for production users, complete these release checks:
+
+- Verify refresh persistence across a physical Android device restart and reauthentication after a lost refresh response.
+- Verify live Twilio delivery and provider failure behavior with the intended sender and destinations.
+- Validate the deployed containers, private backend listener, HTTPS ingress, and mobile connectivity. Configure PostgreSQL TLS when traffic leaves the host.
+- Measure enumeration signals and resource exhaustion under load. The app rate-limits by the immediate TCP peer, so validate proxy client-IP limits and the combined budget.
+- Complete an independent security review and production approval.
