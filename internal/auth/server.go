@@ -32,11 +32,13 @@ type SMS interface {
 }
 
 type Config struct {
+	EmailSender                    EmailSender
 	OTPKey                         []byte
 	PasswordMemory, PasswordPasses uint32
 }
 
 type Server struct {
+	emailSender     EmailSender
 	db              *pgxpool.Pool
 	sms             SMS
 	passwords       passwords
@@ -65,7 +67,7 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	s := &Server{db: db, sms: sms, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
+	s := &Server{db: db, sms: sms, emailSender: cfg.EmailSender, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
 		hashSlots: make(chan struct{}, 2), deliveryContext: ctx, smsSlots: make(chan struct{}, 32), cancel: cancel}
 	s.worker.Go(func() { s.cleanup(ctx) })
 	return s, nil
@@ -98,6 +100,7 @@ func (s *Server) cleanup(ctx context.Context) {
 	for {
 		for _, statement := range []string{
 			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
+			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
@@ -144,6 +147,8 @@ func (s *Server) Handler() http.Handler {
 	s.route(mux, "POST", "auth/recovery/reset", s.reset)
 	s.route(mux, "GET", "me", s.me)
 	s.route(mux, "PATCH", "me", s.updateProfile)
+	s.route(mux, "POST", "me/email/request", s.requestEmailVerification)
+	s.route(mux, "POST", "me/email/verify", s.verifyEmail)
 	return mux
 }
 

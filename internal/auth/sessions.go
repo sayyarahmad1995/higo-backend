@@ -147,11 +147,13 @@ func (s *Server) logout(ctx context.Context, _ input, bearer string) (int, any, 
 }
 
 type currentUser struct {
-	ID           int64    `json:"id"`
-	Phone        string   `json:"phone"`
-	Name         string   `json:"name"`
-	Email        string   `json:"email"`
-	Capabilities []string `json:"capabilities"`
+	ID            int64    `json:"id"`
+	Phone         string   `json:"phone"`
+	Name          string   `json:"name"`
+	Email         string   `json:"email"`
+	EmailVerified bool     `json:"email_verified"`
+	PendingEmail  string   `json:"pending_email"`
+	Capabilities  []string `json:"capabilities"`
 }
 
 func (s *Server) me(ctx context.Context, _ input, bearer string) (int, any, error) {
@@ -159,16 +161,20 @@ func (s *Server) me(ctx context.Context, _ input, bearer string) (int, any, erro
 	if digest == nil {
 		return 0, nil, unauthorized
 	}
-	user, err := scanCurrentUser(s.db.QueryRow(ctx, `SELECT u.id,u.phone,u.name,u.email,u.has_driver_capability FROM auth_sessions s
+	user, err := scanCurrentUser(s.db.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_sessions s
  JOIN auth_users u ON u.id=s.user_id WHERE s.access_digest=$1 AND s.revoked_at IS NULL
  AND s.access_expires_at>now() AND s.expires_at>now()`, digest))
 	return 200, user, err
 }
 
+const currentUserColumns = `u.id,u.phone,u.name,u.email,u.has_driver_capability,u.email_verified_at IS NOT NULL,
+ COALESCE((SELECT c.target_email FROM auth_email_challenges c WHERE c.user_id=u.id
+ AND c.original_email=u.email AND c.password_version=u.password_version AND c.delivered AND c.expires_at>clock_timestamp()),'')`
+
 func scanCurrentUser(row pgx.Row) (currentUser, error) {
 	user := currentUser{Capabilities: []string{"rider"}}
 	var driver bool
-	err := row.Scan(&user.ID, &user.Phone, &user.Name, &user.Email, &driver)
+	err := row.Scan(&user.ID, &user.Phone, &user.Name, &user.Email, &driver, &user.EmailVerified, &user.PendingEmail)
 	if driver {
 		user.Capabilities = append(user.Capabilities, "driver")
 	}

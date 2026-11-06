@@ -14,6 +14,9 @@ var authSchema string
 //go:embed 002_account_capabilities.sql
 var accountCapabilities string
 
+//go:embed 003_email_verification.sql
+var emailVerification string
+
 // Apply serializes migration runners and commits each schema change with its version.
 func Apply(ctx context.Context, db *pgxpool.Pool) error {
 	return pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
@@ -23,7 +26,7 @@ func Apply(ctx context.Context, db *pgxpool.Pool) error {
 		if _, err := tx.Exec(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (version integer PRIMARY KEY)`); err != nil {
 			return err
 		}
-		for i, schema := range []string{authSchema, accountCapabilities} {
+		for i, schema := range []string{authSchema, accountCapabilities, emailVerification} {
 			version := i + 1
 			var applied bool
 			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version=$1)`, version).Scan(&applied); err != nil {
