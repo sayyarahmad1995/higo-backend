@@ -254,6 +254,10 @@ func testAccountBoundaries(t *testing.T, db *pgxpool.Pool, handler http.Handler,
  FROM generate_series(0,1) AS n
  ON CONFLICT(key,bucket) DO UPDATE SET attempts=excluded.attempts,expires_at=excluded.expires_at`, key, seconds, attempts)
 		}
+		passwordKey := auth.HexDigestForTest("email/password/" + strconv.FormatInt(id, 10))
+		seed(passwordKey, 900, 10)
+		expect(t, emailRequest(ctx, access, "password-limit@example.test"), 429, "rate_limited")
+		exec(t, "DELETE FROM auth_rate_limits WHERE key=$1", passwordKey)
 		seed(recipientKey, 3600, 5)
 		expect(t, emailRequest(ctx, access, "MiXeD@example.test"), 429, "rate_limited")
 		exec(t, "DELETE FROM auth_rate_limits WHERE key=$1", recipientKey)
@@ -319,19 +323,39 @@ func testAccountBoundaries(t *testing.T, db *pgxpool.Pool, handler http.Handler,
 		}
 	})
 
-	t.Run("password reset hides and invalidates an outstanding email code", func(t *testing.T) {
-		code := issue(t, access, "old-version@example.test")
+	resetPassword := func(t *testing.T, replacement string) {
+		t.Helper()
 		grant, err := auth.NewTokenForTest("rc_")
 		if err != nil {
 			t.Fatal(err)
 		}
 		exec(t, `INSERT INTO auth_recovery(digest,user_id,password_version,expires_at)
  SELECT $1,id,password_version,now()+interval '10 minutes' FROM auth_users WHERE id=$2`, auth.TokenDigestForTest(grant, "rc_"), id)
-		const replacement = "replacement fixture password"
 		expect(t, send(ctx, http.MethodPost, "auth/recovery/reset", "", map[string]any{"recovery_token": grant, "password": replacement}), 204, "")
+	}
+	t.Run("password reset hides and invalidates an outstanding email code", func(t *testing.T) {
+		code := issue(t, access, "old-version@example.test")
+		const replacement = "replacement fixture password"
+		resetPassword(t, replacement)
 		expect(t, verify(access, code), 401, "unauthorized")
+		password = replacement
+		access = login(t, password)
+		expectProfile(t, access, "verified@example.test", "", true)
+		expect(t, verify(access, code), 400, "invalid_or_expired_code")
+	})
+	t.Run("password reset while delivery is blocked prevents acknowledgement", func(t *testing.T) {
+		var code string
+		const replacement = "second replacement fixture password"
+		blockedDelivery(t, access, "reset-in-flight@example.test", func(value string) {
+			code = value
+			resetPassword(t, replacement)
+		}, 401, "unauthorized")
 		access = login(t, replacement)
 		expectProfile(t, access, "verified@example.test", "", true)
 		expect(t, verify(access, code), 400, "invalid_or_expired_code")
+		var delivered bool
+		if err := db.QueryRow(ctx, "SELECT delivered FROM auth_email_challenges WHERE user_id=$1", id).Scan(&delivered); err != nil || delivered {
+			t.Fatalf("challenge after reset: delivered=%t, err=%v", delivered, err)
+		}
 	})
 }
