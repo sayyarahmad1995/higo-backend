@@ -9,8 +9,12 @@ This document defines the current backend architecture. [PRODUCT.md](PRODUCT.md)
 - **Flutter client:** Existing separate repository, Android first. UI screens initiate user journeys; they are not authoritative for security, permission checks, transactional invariants, or server-owned state.
 - **Backend:** One Go modular monolith exposing application-owned HTTP APIs. Group implementation by business feature, not giant global controller/service/repository layers.
 - **Database:** PostgreSQL is the transactional source of truth, with versioned, forward-only migrations. Do not reset or overwrite databases as part of routine startup.
-- **Administration:** Framework-free HTML/CSS/vanilla JavaScript SPA, with a persistent sidebar and Go APIs. Build operational features only when required by a vertical slice.
+- **Admin Operations:** [HiGO Admin](https://github.com/sayyarahmad1995/higo-admin) runs a separate Go backend and React 19 + TypeScript + Vite frontend. Its independent Docker Compose deployment includes a dedicated Admin PostgreSQL database. Cross-service operations require explicit, authenticated Admin–Core contracts. The optional Core health probe only checks liveness. Core serves no embedded Admin routes or frontend assets, and Admin has no direct access to the Core database.
 - **Infrastructure:** Container-ready, self-managed deployment. Avoid microservices and Redis until a measurable requirement justifies them.
+
+## Core process lifecycle
+
+`cmd/api` starts `internal/app` and reports terminal failures. The app package loads environment configuration, selects delivery providers, configures the PostgreSQL pool, applies existing migrations, and starts the Auth feature. It passes Auth's standard-library router to `internal/httpserver`, which owns listener settings and graceful shutdown. The app handles process signals and closes Auth workers before closing the database pool.
 
 ## Engineering contract
 
