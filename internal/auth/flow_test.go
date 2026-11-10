@@ -85,11 +85,12 @@ func TestAuthenticationFlow(t *testing.T) {
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	emails := make(testEmail, 4)
+	emailSender := &gatedEmail{testEmail: emails}
 	driverService, err := driver.New(isolated, bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := auth.New(ctx, isolated, sms, auth.Config{PurgeDriverDocuments: driverService.PurgeDocuments, EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	server, err := auth.New(ctx, isolated, sms, auth.Config{PurgeDriverDocuments: driverService.PurgeDocuments, EmailSender: emailSender, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -430,6 +431,9 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, late.status, 401, late.body)
 		status, body = patch(secondAccess, map[string]any{"name": "Other"})
 		expect(t, status, 401, body)
+	})
+	t.Run("Account security boundaries", func(t *testing.T) {
+		testAccountBoundaries(t, isolated, handler, server, emailSender, phone, oldPassword)
 	})
 	t.Run("email replacement stays pending and proof is account-bound and single-use", func(t *testing.T) {
 		if len(emails) != 0 {

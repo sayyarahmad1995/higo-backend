@@ -18,3 +18,14 @@ func (s *Server) SaturateSMSForTest() func() {
 		}
 	}
 }
+
+func (s *Server) SaturateHashForTest() func() {
+	for range cap(s.hashSlots) {
+		s.hashSlots <- struct{}{}
+	}
+	return func() {
+		for range cap(s.hashSlots) {
+			<-s.hashSlots
+		}
+	}
+}
