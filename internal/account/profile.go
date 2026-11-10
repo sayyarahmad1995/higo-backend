@@ -1,55 +1,38 @@
-package auth
+package account
 
 import (
 	"context"
-	"net/mail"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 )
 
-type profilePatch struct {
+type ProfilePatch struct {
 	Name  *string `json:"name"`
 	Email *string `json:"email"`
 }
 
-func ValidProfileName(name string) bool {
-	return len(name) > 0 && len(name) <= 150 && !strings.ContainsRune(name, 0)
-}
-
-func ValidProfileEmail(email string) bool {
-	if email == "" {
-		return true
-	}
-	if len(email) > 254 {
-		return false
-	}
-	address, err := mail.ParseAddress(email)
-	return err == nil && address.Address == email
-}
-
-func (s *Server) UpdateProfile(ctx context.Context, body Input, bearer string) (any, error) {
-	proof := NewAccessProof(bearer)
+func (s *Service) UpdateProfile(ctx context.Context, proof auth.AccessProof, patch ProfilePatch) (auth.Profile, error) {
 	if err := proof.Validate(); err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	patch := body.Profile
 	if patch.Name == nil && patch.Email == nil {
-		return nil, invalid
+		return auth.Profile{}, invalid
 	}
 	if patch.Name != nil {
 		*patch.Name = strings.TrimSpace(*patch.Name)
-		if !ValidProfileName(*patch.Name) {
-			return nil, invalid
+		if !auth.ValidProfileName(*patch.Name) {
+			return auth.Profile{}, invalid
 		}
 	}
 	if patch.Email != nil {
 		*patch.Email = strings.TrimSpace(*patch.Email)
-		if !ValidProfileEmail(*patch.Email) {
-			return nil, invalid
+		if !auth.ValidProfileEmail(*patch.Email) {
+			return auth.Profile{}, invalid
 		}
 	}
-	var result Profile
+	var result auth.Profile
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		// Match password reset's account-then-session lock order.
 		target, err := proof.LockProfileAccount(ctx, tx)
@@ -68,4 +51,8 @@ func (s *Server) UpdateProfile(ctx context.Context, body Input, bearer string) (
 		return err
 	})
 	return result, err
+}
+
+func (s *Service) Profile(ctx context.Context, proof auth.AccessProof) (auth.Profile, error) {
+	return s.auth.CurrentProfile(ctx, proof)
 }

@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 )
@@ -15,13 +16,14 @@ import (
 type operation func(context.Context, auth.Input, string) (any, error)
 
 type api struct {
-	auth   *auth.Server
-	driver *driver.Service
+	auth    *auth.Server
+	driver  *driver.Service
+	account *account.Service
 }
 
-// Handler registers the Core HTTP API against the Auth and Driver features.
-func Handler(service *auth.Server, driverService *driver.Service) http.Handler {
-	api := api{auth: service, driver: driverService}
+// Handler registers the Core HTTP API against the Auth, Account, and Driver features.
+func Handler(service *auth.Server, accountService *account.Service, driverService *driver.Service) http.Handler {
+	api := api{auth: service, account: accountService, driver: driverService}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
 	api.authRoute(mux, http.MethodPost, "auth/register", http.StatusAccepted, service.Register)
@@ -32,10 +34,7 @@ func Handler(service *auth.Server, driverService *driver.Service) http.Handler {
 	api.authRoute(mux, http.MethodPost, "auth/recovery/request", http.StatusAccepted, service.RequestRecovery)
 	api.authRoute(mux, http.MethodPost, "auth/recovery/verify", http.StatusOK, service.VerifyRecovery)
 	api.authRoute(mux, http.MethodPost, "auth/recovery/reset", http.StatusNoContent, service.Reset)
-	api.authRoute(mux, http.MethodGet, "me", http.StatusOK, service.Me)
-	api.authRoute(mux, http.MethodPatch, "me", http.StatusOK, service.UpdateProfile)
-	api.authRoute(mux, http.MethodPost, "me/email/request", http.StatusAccepted, service.RequestEmailVerification)
-	api.authRoute(mux, http.MethodPost, "me/email/verify", http.StatusOK, service.VerifyEmail)
+	api.registerAccountRoutes(mux)
 	api.registerDriverRoutes(mux)
 	return mux
 }
@@ -43,12 +42,8 @@ func Handler(service *auth.Server, driverService *driver.Service) http.Handler {
 func (a api) authRoute(mux *http.ServeMux, method, path string, status int, run operation) {
 	a.route(mux, method, path, a.auth.AllowRequest, func(ctx context.Context, w http.ResponseWriter, r *http.Request, bearer string) {
 		var body auth.Input
-		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
-			var target any = &body
-			if method == http.MethodPatch {
-				target = &body.Profile
-			}
-			if err := decodeJSON(w, r, 4096, target); err != nil {
+		if method == http.MethodPost && path != "auth/logout" {
+			if err := decodeJSON(w, r, 4096, &body); err != nil {
 				respond(w, 0, nil, invalidRequest)
 				return
 			}

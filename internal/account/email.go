@@ -1,4 +1,4 @@
-package auth
+package account
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
@@ -15,37 +16,36 @@ type EmailSender interface {
 	Send(ctx context.Context, address, code string) error
 }
 
-func (s *Server) RequestEmailVerification(ctx context.Context, body Input, bearer string) (any, error) {
-	access := NewAccessProof(bearer)
+func (s *Service) RequestEmailVerification(ctx context.Context, access auth.AccessProof, address, password string) (auth.Profile, error) {
 	if err := access.Validate(); err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	address := strings.TrimSpace(body.Email)
-	if address == "" || !ValidProfileEmail(address) || !ValidPassword(body.Password) {
-		return nil, invalid
+	address = strings.TrimSpace(address)
+	if address == "" || !auth.ValidProfileEmail(address) || !auth.ValidPassword(password) {
+		return auth.Profile{}, invalid
 	}
-	snapshot, err := s.PasswordSnapshot(ctx, access)
+	snapshot, err := s.auth.PasswordSnapshot(ctx, access)
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
 	id, version := snapshot.AccountID(), snapshot.PasswordVersion()
 	if s.emailSender == nil {
-		return nil, busy
+		return auth.Profile{}, busy
 	}
 	account := strconv.FormatInt(id, 10)
 	if err := ratelimit.Allow(ctx, s.db, "email/password/"+account, 15*time.Minute, 10); err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	verified, err := snapshot.Verify(body.Password)
+	verified, err := snapshot.Verify(password)
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
 	if !verified {
-		return nil, invalid
+		return auth.Profile{}, invalid
 	}
-	code, proof, err := NewEmailCode()
+	code, proof, err := auth.NewEmailCode()
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		owner, err := access.LockAccount(ctx, tx)
@@ -58,12 +58,12 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		tag, err := tx.Exec(ctx, `INSERT INTO auth_rate_limits (key,bucket,attempts,expires_at)
  VALUES ($1,0,1,clock_timestamp()+interval '60 seconds')
  ON CONFLICT (key,bucket) DO UPDATE SET expires_at=clock_timestamp()+interval '60 seconds'
- WHERE auth_rate_limits.expires_at<=clock_timestamp()`, hexDigest("email/account/"+account))
+ WHERE auth_rate_limits.expires_at<=clock_timestamp()`, ratelimit.Key("email/account/"+account))
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return limited
+			return ratelimit.ErrLimited
 		}
 		for _, budget := range []struct {
 			key    string
@@ -87,12 +87,12 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		return err
 	})
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
 	if err := s.emailSender.Send(ctx, address, code); err != nil {
-		return nil, busy
+		return auth.Profile{}, busy
 	}
-	var profile Profile
+	var profile auth.Profile
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		owner, err := access.LockAccount(ctx, tx)
 		if err != nil {
@@ -108,22 +108,21 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		if tag.RowsAffected() != 1 {
 			return invalid
 		}
-		profile, err = ScanProfile(tx.QueryRow(ctx, `SELECT `+ProfileColumns+` FROM auth_users u WHERE u.id=$1`, id))
+		profile, err = auth.ScanProfile(tx.QueryRow(ctx, `SELECT `+auth.ProfileColumns+` FROM auth_users u WHERE u.id=$1`, id))
 		return err
 	})
 	return profile, err
 }
 
-func (s *Server) VerifyEmail(ctx context.Context, body Input, bearer string) (any, error) {
-	access := NewAccessProof(bearer)
+func (s *Service) VerifyEmail(ctx context.Context, access auth.AccessProof, code string) (auth.Profile, error) {
 	if err := access.Validate(); err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	proof := EmailCodeDigest(strings.TrimSpace(body.Code))
+	proof := auth.EmailCodeDigest(strings.TrimSpace(code))
 	if proof == nil {
-		return nil, invalidCode
+		return auth.Profile{}, invalidCode
 	}
-	var profile Profile
+	var profile auth.Profile
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		id, err := access.LockAccount(ctx, tx)
 		if err != nil {
@@ -139,7 +138,7 @@ func (s *Server) VerifyEmail(ctx context.Context, body Input, bearer string) (an
 		if err != nil {
 			return err
 		}
-		profile, err = ScanProfile(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+ProfileColumns, id, address))
+		profile, err = auth.ScanProfile(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+auth.ProfileColumns, id, address))
 		return err
 	})
 	return profile, err

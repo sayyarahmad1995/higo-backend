@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 )
@@ -26,6 +27,9 @@ func outcome(err error) string {
 		return requestErr.Error()
 	}
 	if code := auth.ErrorCode(err); code != "" {
+		return code
+	}
+	if code := account.ErrorCode(err); code != "" {
 		return code
 	}
 	if code := driver.ErrorCode(err); code != "" {

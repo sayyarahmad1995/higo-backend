@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
@@ -45,11 +46,13 @@ func Run() error {
 	if err != nil {
 		return err
 	}
+	cfg.auth.PurgeAccountEmailChallenges = func(ctx context.Context) { account.PurgeExpiredEmailChallenges(ctx, db) }
 	cfg.auth.PurgeDriverDocuments = driverService.PurgeDocuments
 	api, err := auth.New(ctx, db, cfg.sms, cfg.auth)
 	if err != nil {
 		return err
 	}
 	defer api.Close()
-	return httpserver.Run(ctx, cfg.address, httpapi.Handler(api, driverService))
+	accountService := account.New(db, api, cfg.emailSender)
+	return httpserver.Run(ctx, cfg.address, httpapi.Handler(api, accountService, driverService))
 }

@@ -157,14 +157,6 @@ type Profile struct {
 	Capabilities  []string `json:"capabilities"`
 }
 
-func (s *Server) Me(ctx context.Context, _ Input, bearer string) (any, error) {
-	return s.currentAccount(ctx, bearer)
-}
-
-func (s *Server) currentAccount(ctx context.Context, bearer string) (Profile, error) {
-	return s.CurrentProfile(ctx, NewAccessProof(bearer))
-}
-
 func (s *Server) CurrentProfile(ctx context.Context, proof AccessProof) (Profile, error) {
 	if err := proof.Validate(); err != nil {
 		return Profile{}, err
