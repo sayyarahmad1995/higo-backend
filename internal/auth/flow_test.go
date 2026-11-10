@@ -208,6 +208,9 @@ func TestAuthenticationFlow(t *testing.T) {
 	if body["phone"] != phone {
 		t.Fatal("wrong current user")
 	}
+	t.Run("upload reservation boundary", func(t *testing.T) {
+		testUploadReservations(t, handler, server, isolated, access, int64(body["id"].(float64)))
+	})
 	t.Run("redesigned onboarding is resumable, bounded and immutable", func(t *testing.T) {
 		const path = "me/driver-application"
 		var picture bytes.Buffer
@@ -228,18 +231,6 @@ func TestAuthenticationFlow(t *testing.T) {
 		apply(update(http.MethodPatch, path, draft, 200))
 		draft["step"] = "1"
 		update(http.MethodPatch, path, draft, 409)
-		t.Run("streamed oversized upload keeps the 413 contract", func(t *testing.T) {
-			data := `{"kind":"selfie","image":"` + strings.Repeat("A", 3*1024*1024) + `"}`
-			req := httptest.NewRequest(http.MethodPost, "/api/v1/"+path+"/document", strings.NewReader(data))
-			req.ContentLength = -1
-			req.RemoteAddr = "192.0.2.12:12345"
-			req.Header.Set("Authorization", "Bearer "+access)
-			recorder := httptest.NewRecorder()
-			handler.ServeHTTP(recorder, req)
-			if recorder.Code != http.StatusRequestEntityTooLarge || recorder.Body.String() != "{\"error\":\"document_too_large\"}\n" {
-				t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body)
-			}
-		})
 		upload("selfie", []byte("bad image"), 400)
 		upload("selfie", make([]byte, auth.MaxVehicleDocumentForTest+1), 413)
 		upload("selfie", make([]byte, 3*auth.MaxVehicleDocumentForTest), 413)
