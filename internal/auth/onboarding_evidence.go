@@ -102,19 +102,19 @@ func onboardingDocumentAAD(id int64, version int, kind string) []byte {
 	return []byte(fmt.Sprintf("driver-onboarding:%d:%d:%s", id, version, kind))
 }
 
-func (s *Server) saveOnboardingDocument(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) SaveOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
 	doc := body.OnboardingDocument
 	if !hasDocument(requiredOnboardingDocuments, doc.Kind) && doc.Kind != "additional" {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	if s.driverDocumentCipher == nil {
-		return 0, nil, busy
+		return nil, busy
 	}
 	select {
 	case s.driverDocumentSlots <- struct{}{}:
 		defer func() { <-s.driverDocumentSlots }()
 	default:
-		return 0, nil, busy
+		return nil, busy
 	}
 	limit := maxVehicleDocument
 	if doc.Kind == "cnic_front" || doc.Kind == "cnic_back" {
@@ -122,7 +122,7 @@ func (s *Server) saveOnboardingDocument(ctx context.Context, body input, bearer 
 	}
 	normalized, err := normalizeDocumentImage(doc.Image, limit)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if current.SubmittedAt != nil {
@@ -163,15 +163,15 @@ func (s *Server) saveOnboardingDocument(ctx context.Context, body input, bearer 
 	})
 }
 
-func (s *Server) previewOnboardingDocument(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) PreviewOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
 	if s.driverDocumentCipher == nil {
-		return 0, nil, busy
+		return nil, busy
 	}
 	if !hasDocument(requiredOnboardingDocuments, body.OnboardingPreview) && body.OnboardingPreview != "additional" {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	var plain []byte
-	_, _, err := s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+	_, err := s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if current.SubmittedAt != nil {
 			return onboardingConflict
 		}
@@ -186,13 +186,13 @@ func (s *Server) previewOnboardingDocument(ctx context.Context, body input, bear
 		plain, err = s.driverDocumentCipher.Open(nil, nil, data, onboardingDocumentAAD(id, current.Version, body.OnboardingPreview))
 		return err
 	})
-	return 200, map[string][]byte{"image": plain}, err
+	return map[string][]byte{"image": plain}, err
 }
 
-func (s *Server) removeOnboardingDocument(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) RemoveOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
 	doc := body.OnboardingDocument
 	if doc.Kind != "additional" {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if current.SubmittedAt != nil || current.Draft["revision"] != doc.Revision {

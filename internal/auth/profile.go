@@ -29,25 +29,25 @@ func validProfileEmail(email string) bool {
 	return err == nil && address.Address == email
 }
 
-func (s *Server) updateProfile(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) UpdateProfile(ctx context.Context, body Input, bearer string) (any, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	patch := body.Profile
 	if patch.Name == nil && patch.Email == nil {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	if patch.Name != nil {
 		*patch.Name = strings.TrimSpace(*patch.Name)
 		if !validProfileName(*patch.Name) {
-			return 0, nil, invalid
+			return nil, invalid
 		}
 	}
 	if patch.Email != nil {
 		*patch.Email = strings.TrimSpace(*patch.Email)
 		if !validProfileEmail(*patch.Email) {
-			return 0, nil, invalid
+			return nil, invalid
 		}
 	}
 	var result currentUser
@@ -79,5 +79,5 @@ func (s *Server) updateProfile(ctx context.Context, body input, bearer string) (
  RETURNING `+currentUserColumns, digest, userID, patch.Name, patch.Email))
 		return err
 	})
-	return 200, result, err
+	return result, err
 }

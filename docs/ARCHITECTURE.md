@@ -14,7 +14,11 @@ This document defines the current backend architecture. [PRODUCT.md](PRODUCT.md)
 
 ## Core process lifecycle
 
-`cmd/api` starts `internal/app` and reports terminal failures. The app package loads environment configuration, selects delivery providers, configures the PostgreSQL pool, applies existing migrations, and starts the Auth feature. It passes Auth's standard-library router to `internal/httpserver`, which owns listener settings and graceful shutdown. The app handles process signals and closes Auth workers before closing the database pool.
+`cmd/api` starts `internal/app` and reports terminal failures. The app package loads environment configuration, selects delivery providers, configures the PostgreSQL pool, applies existing migrations, and starts the Auth feature. It builds the standard-library router in `internal/httpapi` and gives it to `internal/httpserver`, which owns listener settings and graceful shutdown. The app handles process signals and closes Auth workers before closing the database pool.
+
+## HTTP transport
+
+`internal/httpapi` registers routes and methods, decodes bounded requests, sets request deadlines, and encodes responses and error statuses. It calls concrete Auth operations. Auth owns authentication, authorization, rate-limit budgets, upload and preview reservations, and transactions. Account and Driver business operations still live in Auth.
 
 ## Engineering contract
 

@@ -17,8 +17,6 @@ var (
 	onboardingRegistration = regexp.MustCompile(`^[A-Z0-9][A-Z0-9 -]{1,23}$`)
 )
 
-const onboardingPath = "me/driver-application"
-
 const purgeAbandonedOnboardingDocuments = `WITH expired AS (
  SELECT user_id,application_version FROM driver_onboarding_applications
  WHERE submitted_at IS NULL AND EXISTS (SELECT 1 FROM driver_onboarding_documents d WHERE (d.user_id,d.application_version)=(driver_onboarding_applications.user_id,driver_onboarding_applications.application_version))
@@ -70,10 +68,10 @@ func readOnboarding(ctx context.Context, tx pgx.Tx, id int64) (onboardingApplica
 	return result, nil
 }
 
-func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(pgx.Tx, int64, onboardingApplication) error) (int, any, error) {
+func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(pgx.Tx, int64, onboardingApplication) error) (any, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	var result onboardingApplication
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -91,10 +89,10 @@ func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(
 		result, err = readOnboarding(ctx, tx, id)
 		return err
 	})
-	return 200, result, err
+	return result, err
 }
 
-func (s *Server) getOnboarding(ctx context.Context, _ input, bearer string) (int, any, error) {
+func (s *Server) GetOnboarding(ctx context.Context, _ Input, bearer string) (any, error) {
 	return s.withOnboarding(ctx, bearer, nil)
 }
 
@@ -111,7 +109,7 @@ func completeVehicle(details map[string]string) bool {
 	return true
 }
 
-func (s *Server) saveOnboarding(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) SaveOnboarding(ctx context.Context, body Input, bearer string) (any, error) {
 	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if body.OnboardingDraft == nil {
 			return invalid
@@ -173,7 +171,7 @@ func (s *Server) saveOnboarding(ctx context.Context, body input, bearer string) 
 	})
 }
 
-func (s *Server) submitOnboarding(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) SubmitOnboarding(ctx context.Context, body Input, bearer string) (any, error) {
 	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if body.OnboardingSubmit.Revision != current.Draft["revision"] {
 			return onboardingConflict

@@ -14,43 +14,43 @@ type EmailSender interface {
 	Send(ctx context.Context, address, code string) error
 }
 
-func (s *Server) requestEmailVerification(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) RequestEmailVerification(ctx context.Context, body Input, bearer string) (any, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	address := strings.TrimSpace(body.Email)
 	if address == "" || !validProfileEmail(address) || !validPassword(body.Password) {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	var id, version int64
 	var hash string
 	err := s.db.QueryRow(ctx, `SELECT u.id,u.password_version,u.password_hash FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
  WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>now() AND s.expires_at>now()`, digest).Scan(&id, &version, &hash)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	if s.emailSender == nil {
-		return 0, nil, busy
+		return nil, busy
 	}
 	account := strconv.FormatInt(id, 10)
 	if err := allow(ctx, s.db, "email/password/"+account, 15*time.Minute, 10); err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	if err := s.acquireHash(); err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	verified := s.passwords.verify(hash, body.Password)
 	<-s.hashSlots
 	if !verified {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	code, err := newToken("em_")
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	proof := tokenDigest(code, "em_")
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -93,10 +93,10 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 		return err
 	})
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	if err := s.emailSender.Send(ctx, address, code); err != nil {
-		return 0, nil, busy
+		return nil, busy
 	}
 	var profile currentUser
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -117,7 +117,7 @@ func (s *Server) requestEmailVerification(ctx context.Context, body input, beare
 		profile, err = scanCurrentUser(tx.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_users u WHERE u.id=$1`, id))
 		return err
 	})
-	return 202, profile, err
+	return profile, err
 }
 
 func lockSessionAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
@@ -138,14 +138,14 @@ func lockSessionAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, e
 	return id, err
 }
 
-func (s *Server) verifyEmail(ctx context.Context, body input, bearer string) (int, any, error) {
+func (s *Server) VerifyEmail(ctx context.Context, body Input, bearer string) (any, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	proof := tokenDigest(strings.TrimSpace(body.Code), "em_")
 	if proof == nil {
-		return 0, nil, invalidCode
+		return nil, invalidCode
 	}
 	var profile currentUser
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -166,5 +166,5 @@ func (s *Server) verifyEmail(ctx context.Context, body input, bearer string) (in
 		profile, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+currentUserColumns, id, address))
 		return err
 	})
-	return 200, profile, err
+	return profile, err
 }
