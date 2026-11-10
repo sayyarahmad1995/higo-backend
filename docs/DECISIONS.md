@@ -12,7 +12,7 @@
 | Sessions | Application-owned, rotating and revocable sessions |
 | Database | PostgreSQL, versioned migrations |
 | Infrastructure | Lightweight self-managed, container-ready; no speculative microservices |
-| Admin | Framework-free single-page app using HTML/CSS/vanilla JS and Go APIs |
+| Admin | Independent Admin Operations deployment with a Go backend, React 19 + TypeScript + Vite frontend, and dedicated PostgreSQL database. Cross-service operations use explicit, authenticated Admin–Core contracts. |
 | Delivery | End-to-end vertical slices driven by actual Flutter user journeys |
 | Documentation | This concise current-state handbook is authoritative; old repository is reference only |
 
