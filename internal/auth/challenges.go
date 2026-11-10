@@ -19,29 +19,29 @@ func (s *Server) otpDigest(purpose, challenge, code string) []byte {
 	return mac.Sum(nil)
 }
 
-func (s *Server) register(ctx context.Context, body input, _ string) (int, any, error) {
+func (s *Server) Register(ctx context.Context, body Input, _ string) (any, error) {
 	phone := phoneNumber(body.Phone)
 	name := strings.TrimSpace(body.Name)
 	email := strings.TrimSpace(body.Email)
 	if phone == "" || !validPassword(body.Password) || !validProfileName(name) || !validProfileEmail(email) {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	return s.issue(ctx, registration, phone, body.Password, name, email)
 }
 
-func (s *Server) requestRecovery(ctx context.Context, body input, _ string) (int, any, error) {
+func (s *Server) RequestRecovery(ctx context.Context, body Input, _ string) (any, error) {
 	phone := phoneNumber(body.Phone)
 	if phone == "" {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	return s.issue(ctx, recovery, phone, "", "", "")
 }
 
-func (s *Server) issue(ctx context.Context, purpose, phone, password, name, email string) (int, any, error) {
+func (s *Server) issue(ctx context.Context, purpose, phone, password, name, email string) (any, error) {
 	select {
 	case s.smsSlots <- struct{}{}:
 	default:
-		return 0, nil, busy
+		return nil, busy
 	}
 	queued := false
 	defer func() {
@@ -50,23 +50,23 @@ func (s *Server) issue(ctx context.Context, purpose, phone, password, name, emai
 		}
 	}()
 	if err := s.reserveSMS(ctx, purpose, phone); err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	var passwordHash *string
 	if purpose == registration {
 		hash, err := s.hash(password)
 		if err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		passwordHash = &hash
 	}
 	challenge, err := newToken("oc_")
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	code, err := newOTP()
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	id := tokenDigest(challenge, "oc_")
 	var send bool
@@ -78,11 +78,11 @@ func (s *Server) issue(ctx context.Context, purpose, phone, password, name, emai
  RETURNING CASE WHEN purpose='recovery' THEN user_id IS NOT NULL ELSE NOT EXISTS(SELECT 1 FROM account) END`,
 		id, purpose, phone, passwordHash, name, email, s.otpDigest(purpose, challenge, code)).Scan(&send)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	s.dispatchSMS(delivery{id, phone, code, send})
 	queued = true
-	return 202, map[string]any{"challenge": challenge, "expires_in": 300, "resend_after": 60}, nil
+	return map[string]any{"challenge": challenge, "expires_in": 300, "resend_after": 60}, nil
 }
 
 type challengeRecord struct {
@@ -91,13 +91,12 @@ type challengeRecord struct {
 	user, version      *int64
 }
 
-func (s *Server) verifyChallenge(ctx context.Context, body input, purpose string, finish func(pgx.Tx, challengeRecord) (int, any, error)) (int, any, error) {
+func (s *Server) verifyChallenge(ctx context.Context, body Input, purpose string, finish func(pgx.Tx, challengeRecord) (any, error)) (any, error) {
 	id := tokenDigest(body.Challenge, "oc_")
 	if id == nil || !otpPattern.MatchString(body.Code) {
-		return 0, nil, invalidCode
+		return nil, invalidCode
 	}
 	var result any
-	var status int
 	var rejected error
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		var record challengeRecord
@@ -113,7 +112,7 @@ func (s *Server) verifyChallenge(ctx context.Context, body input, purpose string
 		if err != nil {
 			return err
 		}
-		status, result, err = finish(tx, record)
+		result, err = finish(tx, record)
 		if err == invalidCode {
 			rejected = err
 			return nil
@@ -121,69 +120,69 @@ func (s *Server) verifyChallenge(ctx context.Context, body input, purpose string
 		return err
 	})
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
-	return status, result, rejected
+	return result, rejected
 }
 
-func (s *Server) verifyRegistration(ctx context.Context, body input, _ string) (int, any, error) {
-	return s.verifyChallenge(ctx, body, registration, func(tx pgx.Tx, record challengeRecord) (int, any, error) {
+func (s *Server) VerifyRegistration(ctx context.Context, body Input, _ string) (any, error) {
+	return s.verifyChallenge(ctx, body, registration, func(tx pgx.Tx, record challengeRecord) (any, error) {
 		var user int64
 		err := tx.QueryRow(ctx, `INSERT INTO auth_users (phone,password_hash,name,email) VALUES ($1,$2,$3,$4)
    ON CONFLICT (phone) DO NOTHING RETURNING id`, record.phone, *record.hash, record.name, record.email).Scan(&user)
 		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil, invalidCode
+			return nil, invalidCode
 		}
 		if err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		session, err := issueSession(ctx, tx, user)
-		return 201, session, err
+		return session, err
 	})
 }
 
-func (s *Server) verifyRecovery(ctx context.Context, body input, _ string) (int, any, error) {
-	return s.verifyChallenge(ctx, body, recovery, func(tx pgx.Tx, record challengeRecord) (int, any, error) {
+func (s *Server) VerifyRecovery(ctx context.Context, body Input, _ string) (any, error) {
+	return s.verifyChallenge(ctx, body, recovery, func(tx pgx.Tx, record challengeRecord) (any, error) {
 		if record.user == nil {
-			return 0, nil, invalidCode
+			return nil, invalidCode
 		}
 		var version int64
 		err := tx.QueryRow(ctx, `SELECT password_version FROM auth_users WHERE id=$1 FOR UPDATE`, *record.user).Scan(&version)
 		if errors.Is(err, pgx.ErrNoRows) || (err == nil && version != *record.version) {
-			return 0, nil, invalidCode
+			return nil, invalidCode
 		}
 		if err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		token, err := newToken("rc_")
 		if err != nil {
-			return 0, nil, err
+			return nil, err
 		}
 		_, err = tx.Exec(ctx, `INSERT INTO auth_recovery VALUES($1,$2,$3,now()+interval '10 minutes')`,
 			tokenDigest(token, "rc_"), *record.user, version)
-		return 200, map[string]any{"recovery_token": token, "expires_in": 600}, err
+		return map[string]any{"recovery_token": token, "expires_in": 600}, err
 	})
 }
 
-func (s *Server) reset(ctx context.Context, body input, _ string) (int, any, error) {
+func (s *Server) Reset(ctx context.Context, body Input, _ string) (any, error) {
 	digest := tokenDigest(body.Recovery, "rc_")
 	if digest == nil {
-		return 0, nil, invalidRecovery
+		return nil, invalidRecovery
 	}
 	if !validPassword(body.Password) {
-		return 0, nil, invalid
+		return nil, invalid
 	}
 	var user, version int64
 	err := s.db.QueryRow(ctx, `SELECT user_id,password_version FROM auth_recovery WHERE digest=$1 AND expires_at>now()`, digest).Scan(&user, &version)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil, invalidRecovery
+		return nil, invalidRecovery
 	}
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	hash, err := s.hash(body.Password)
 	if err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE auth_users SET password_hash=$3,password_version=password_version+1 WHERE id=$1 AND password_version=$2`, user, version, hash)
@@ -206,5 +205,5 @@ func (s *Server) reset(ctx context.Context, body input, _ string) (int, any, err
 		_, err = tx.Exec(ctx, `UPDATE auth_sessions SET revoked_at=now() WHERE user_id=$1 AND revoked_at IS NULL`, user)
 		return err
 	})
-	return 204, nil, err
+	return nil, err
 }

@@ -43,28 +43,28 @@ func issueSession(ctx context.Context, tx pgx.Tx, user int64) (sessionTokens, er
 	return tokens, insertRefresh(ctx, tx, id, tokens.Refresh)
 }
 
-func (s *Server) login(ctx context.Context, body input, _ string) (int, any, error) {
+func (s *Server) Login(ctx context.Context, body Input, _ string) (any, error) {
 	phone := phoneNumber(body.Phone)
 	if phone == "" || !validPassword(body.Password) {
-		return 0, nil, denied
+		return nil, denied
 	}
 	if err := allow(ctx, s.db, "login/phone/"+phone, 15*time.Minute, 10); err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	var user, version int64
 	hash := s.dummyHash
 	err := s.db.QueryRow(ctx, `SELECT id,password_version,password_hash FROM auth_users WHERE phone=$1`, phone).Scan(&user, &version, &hash)
 	exists := err == nil
 	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil, err
+		return nil, err
 	}
 	if err := s.acquireHash(); err != nil {
-		return 0, nil, err
+		return nil, err
 	}
 	verified := s.passwords.verify(hash, body.Password)
 	<-s.hashSlots
 	if !exists || !verified {
-		return 0, nil, denied
+		return nil, denied
 	}
 	var tokens sessionTokens
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
@@ -79,13 +79,13 @@ func (s *Server) login(ctx context.Context, body input, _ string) (int, any, err
 		tokens, err = issueSession(ctx, tx, user)
 		return err
 	})
-	return 200, tokens, err
+	return tokens, err
 }
 
-func (s *Server) refresh(ctx context.Context, body input, _ string) (int, any, error) {
+func (s *Server) Refresh(ctx context.Context, body Input, _ string) (any, error) {
 	digest := tokenDigest(body.Refresh, "rt_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	var replay bool
 	var tokens sessionTokens
@@ -128,22 +128,22 @@ func (s *Server) refresh(ctx context.Context, body input, _ string) (int, any, e
 	})
 	if err == nil && replay {
 		slog.Warn("auth_refresh_replay_session_revoked")
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
-	return 200, tokens, err
+	return tokens, err
 }
 
-func (s *Server) logout(ctx context.Context, _ input, bearer string) (int, any, error) {
+func (s *Server) Logout(ctx context.Context, _ Input, bearer string) (any, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
 	tag, err := s.db.Exec(ctx, `UPDATE auth_sessions SET revoked_at=now()
  WHERE access_digest=$1 AND revoked_at IS NULL AND access_expires_at>now() AND expires_at>now()`, digest)
 	if err == nil && tag.RowsAffected() == 0 {
-		return 0, nil, unauthorized
+		return nil, unauthorized
 	}
-	return 204, nil, err
+	return nil, err
 }
 
 type currentUser struct {
@@ -156,15 +156,18 @@ type currentUser struct {
 	Capabilities  []string `json:"capabilities"`
 }
 
-func (s *Server) me(ctx context.Context, _ input, bearer string) (int, any, error) {
+func (s *Server) Me(ctx context.Context, _ Input, bearer string) (any, error) {
+	return s.currentAccount(ctx, bearer)
+}
+
+func (s *Server) currentAccount(ctx context.Context, bearer string) (currentUser, error) {
 	digest := tokenDigest(bearer, "at_")
 	if digest == nil {
-		return 0, nil, unauthorized
+		return currentUser{}, unauthorized
 	}
-	user, err := scanCurrentUser(s.db.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_sessions s
+	return scanCurrentUser(s.db.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_sessions s
  JOIN auth_users u ON u.id=s.user_id WHERE s.access_digest=$1 AND s.revoked_at IS NULL
  AND s.access_expires_at>now() AND s.expires_at>now()`, digest))
-	return 200, user, err
 }
 
 const currentUserColumns = `u.id,u.phone,u.name,u.email,u.has_driver_capability,u.email_verified_at IS NOT NULL,

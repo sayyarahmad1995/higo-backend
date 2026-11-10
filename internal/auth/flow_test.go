@@ -1,4 +1,4 @@
-package auth
+package auth_test
 
 import (
 	"bytes"
@@ -11,12 +11,15 @@ import (
 	"net/http/httptest"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
 	"github.com/sayyarahmad1995/higo-backend/migrations"
 )
 
@@ -57,11 +60,11 @@ func TestAuthenticationFlow(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	schema, err := newToken("")
+	schema, err := auth.NewTokenForTest("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	schema = "test_" + hexDigest(schema)[:16]
+	schema = "test_" + auth.HexDigestForTest(schema)[:16]
 	if _, err := db.Exec(ctx, "CREATE SCHEMA "+schema); err != nil {
 		t.Fatal(err)
 	}
@@ -81,12 +84,12 @@ func TestAuthenticationFlow(t *testing.T) {
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	emails := make(testEmail, 4)
-	server, err := New(ctx, isolated, sms, Config{DriverDocumentKey: bytes.Repeat([]byte{8}, 32), EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	server, err := auth.New(ctx, isolated, sms, auth.Config{DriverDocumentKey: bytes.Repeat([]byte{8}, 32), EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	handler := server.Handler()
+	handler := httpapi.Handler(server)
 	peer := "192.0.2.1:12345"
 	call := func(method, path, bearer string, body any) (int, map[string]any) {
 		data, _ := json.Marshal(body)
@@ -117,7 +120,7 @@ func TestAuthenticationFlow(t *testing.T) {
 			deadline := time.Now().Add(3 * time.Second)
 			for time.Now().Before(deadline) {
 				var delivered bool
-				err := isolated.QueryRow(ctx, "SELECT delivered FROM auth_challenges WHERE id=$1", tokenDigest(challenge, "oc_")).Scan(&delivered)
+				err := isolated.QueryRow(ctx, "SELECT delivered FROM auth_challenges WHERE id=$1", auth.TokenDigestForTest(challenge, "oc_")).Scan(&delivered)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -132,6 +135,39 @@ func TestAuthenticationFlow(t *testing.T) {
 		}
 		return ""
 	}
+	t.Run("malformed request bodies keep the HTTP error contract", func(t *testing.T) {
+		for _, tc := range []struct {
+			name string
+			body string
+		}{
+			{"malformed JSON", `{"phone":`},
+			{"unknown field", `{"unknown":true}`},
+			{"trailing value", `{} {}`},
+			{"oversized body", `{"phone":"` + strings.Repeat("0", 4096) + `"}`},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(tc.body))
+				req.RemoteAddr = "192.0.2.11:12345"
+				recorder := httptest.NewRecorder()
+				handler.ServeHTTP(recorder, req)
+				if recorder.Code != http.StatusBadRequest || recorder.Body.String() != "{\"error\":\"invalid_request\"}\n" ||
+					recorder.Header().Get("Content-Type") != "application/json" || recorder.Header().Get("Cache-Control") != "no-store" {
+					t.Fatalf("unexpected response: %d %v %s", recorder.Code, recorder.Header(), recorder.Body)
+				}
+			})
+		}
+	})
+	t.Run("canceled request stops before decoding", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/v1/auth/login", strings.NewReader("{"))
+		req.RemoteAddr = "192.0.2.11:12345"
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		if recorder.Code != http.StatusInternalServerError || recorder.Body.String() != "{\"error\":\"internal_error\"}\n" {
+			t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body)
+		}
+	})
 	const phone = "+923001234567"
 	const oldPassword = "the original password"
 	const newPassword = "the replacement password"
@@ -192,9 +228,21 @@ func TestAuthenticationFlow(t *testing.T) {
 		apply(update(http.MethodPatch, path, draft, 200))
 		draft["step"] = "1"
 		update(http.MethodPatch, path, draft, 409)
+		t.Run("streamed oversized upload keeps the 413 contract", func(t *testing.T) {
+			data := `{"kind":"selfie","image":"` + strings.Repeat("A", 3*1024*1024) + `"}`
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/"+path+"/document", strings.NewReader(data))
+			req.ContentLength = -1
+			req.RemoteAddr = "192.0.2.12:12345"
+			req.Header.Set("Authorization", "Bearer "+access)
+			recorder := httptest.NewRecorder()
+			handler.ServeHTTP(recorder, req)
+			if recorder.Code != http.StatusRequestEntityTooLarge || recorder.Body.String() != "{\"error\":\"document_too_large\"}\n" {
+				t.Fatalf("unexpected response: %d %s", recorder.Code, recorder.Body)
+			}
+		})
 		upload("selfie", []byte("bad image"), 400)
-		upload("selfie", make([]byte, maxVehicleDocument+1), 413)
-		upload("selfie", make([]byte, 3*maxVehicleDocument), 413)
+		upload("selfie", make([]byte, auth.MaxVehicleDocumentForTest+1), 413)
+		upload("selfie", make([]byte, 3*auth.MaxVehicleDocumentForTest), 413)
 		apply(upload("selfie", picture.Bytes(), 200))
 		savedRevision := draft["revision"]
 		retry := update(http.MethodPost, path+"/document", map[string]any{
@@ -237,8 +285,8 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, a.status, 200, a.body)
 		expect(t, b.status, 409, b.body)
 		apply(a.body)
-		upload("cnic_front", make([]byte, maxDriverImage+1), 413)
-		for _, kind := range requiredOnboardingDocuments[1:] {
+		upload("cnic_front", make([]byte, auth.MaxDriverImageForTest+1), 413)
+		for _, kind := range auth.RequiredOnboardingDocumentsForTest[1:] {
 			apply(upload(kind, picture.Bytes(), 200))
 		}
 		apply(upload("additional", picture.Bytes(), 200))
@@ -280,13 +328,13 @@ func TestAuthenticationFlow(t *testing.T) {
 			if err := rows.Scan(&id, &kind, &encrypted); err != nil {
 				t.Fatal(err)
 			}
-			data, err := server.driverDocumentCipher.Open(nil, nil, encrypted, onboardingDocumentAAD(id, 1, kind))
+			data, err := server.OpenDocumentForTest(encrypted, id, 1, kind)
 			if err != nil || !bytes.HasPrefix(data, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted, picture.Bytes()[:8]) {
 				t.Fatalf("encryption of %s: %v", kind, err)
 			}
 			count++
 		}
-		if err := rows.Err(); err != nil || count != len(requiredOnboardingDocuments) {
+		if err := rows.Err(); err != nil || count != len(auth.RequiredOnboardingDocumentsForTest) {
 			t.Fatalf("evidence count %d: %v", count, err)
 		}
 		status, body = call(http.MethodGet, "me", restored, nil)
@@ -393,7 +441,7 @@ func TestAuthenticationFlow(t *testing.T) {
 			t.Fatal(err)
 		}
 		resetCooldown := func() {
-			if _, err := isolated.Exec(ctx, `DELETE FROM auth_rate_limits WHERE key=$1`, hexDigest("email/account/"+strconv.FormatInt(id, 10))); err != nil {
+			if _, err := isolated.Exec(ctx, `DELETE FROM auth_rate_limits WHERE key=$1`, auth.HexDigestForTest("email/account/"+strconv.FormatInt(id, 10))); err != nil {
 				t.Fatal(err)
 			}
 		}
@@ -444,7 +492,7 @@ func TestAuthenticationFlow(t *testing.T) {
  INSERT INTO driver_onboarding_documents SELECT user_id,application_version,'selfie',decode(repeat('01',29),'hex') FROM draft`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := isolated.Exec(ctx, purgeAbandonedOnboardingDocuments); err != nil {
+		if _, err := isolated.Exec(ctx, auth.PurgeAbandonedOnboardingDocumentsForTest); err != nil {
 			t.Fatal(err)
 		}
 		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
@@ -516,7 +564,7 @@ func TestAuthenticationFlow(t *testing.T) {
 	status, body = post("login", credentials)
 	expect(t, status, 200, body)
 	access = body["access_token"].(string)
-	if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key=$1", hexDigest("sms/phone/"+phone)); err != nil {
+	if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key=$1", auth.HexDigestForTest("sms/phone/"+phone)); err != nil {
 		t.Fatal(err)
 	}
 	status, body = post("recovery/request", map[string]string{"phone": phone})
@@ -556,7 +604,7 @@ func TestAuthenticationFlow(t *testing.T) {
 			challenge := body["challenge"].(string)
 			code := receiveCode(t, challenge)
 			if scenario.expire {
-				if _, err := isolated.Exec(ctx, "UPDATE auth_challenges SET expires_at=now()-interval '1 second' WHERE id=$1", tokenDigest(challenge, "oc_")); err != nil {
+				if _, err := isolated.Exec(ctx, "UPDATE auth_challenges SET expires_at=now()-interval '1 second' WHERE id=$1", auth.TokenDigestForTest(challenge, "oc_")); err != nil {
 					t.Fatal(err)
 				}
 			} else {
@@ -580,7 +628,7 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body := post("login", credentials)
 		expect(t, status, 200, body)
 		access := body["access_token"].(string)
-		if _, err := isolated.Exec(ctx, "UPDATE auth_sessions SET access_expires_at=now()-interval '1 second' WHERE access_digest=$1", tokenDigest(access, "at_")); err != nil {
+		if _, err := isolated.Exec(ctx, "UPDATE auth_sessions SET access_expires_at=now()-interval '1 second' WHERE access_digest=$1", auth.TokenDigestForTest(access, "at_")); err != nil {
 			t.Fatal(err)
 		}
 		status, body = call(http.MethodGet, "me", access, nil)
@@ -604,7 +652,7 @@ func TestAuthenticationFlow(t *testing.T) {
 			status, body = post("register", credentials)
 			expect(t, status, 429, body)
 		}
-		if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key=$1", hexDigest("sms/phone/"+number)); err != nil {
+		if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key=$1", auth.HexDigestForTest("sms/phone/"+number)); err != nil {
 			t.Fatal(err)
 		}
 		status, body = post("register", credentials)
@@ -614,7 +662,7 @@ func TestAuthenticationFlow(t *testing.T) {
 	t.Run("refresh advertises the remaining access lifetime", func(t *testing.T) {
 		status, body := post("login", credentials)
 		expect(t, status, 200, body)
-		if _, err := isolated.Exec(ctx, "UPDATE auth_sessions SET expires_at=now()+interval '30 seconds' WHERE access_digest=$1", tokenDigest(body["access_token"].(string), "at_")); err != nil {
+		if _, err := isolated.Exec(ctx, "UPDATE auth_sessions SET expires_at=now()+interval '30 seconds' WHERE access_digest=$1", auth.TokenDigestForTest(body["access_token"].(string), "at_")); err != nil {
 			t.Fatal(err)
 		}
 		status, body = post("refresh", map[string]string{"refresh_token": body["refresh_token"].(string)})
@@ -655,7 +703,7 @@ func TestAuthenticationFlow(t *testing.T) {
 
 	t.Run("a stalled SMS does not delay another recipient", func(t *testing.T) {
 		const other = "+923061234567"
-		if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key IN ($1,$2)", hexDigest("sms/phone/"+phone), hexDigest("sms/phone/"+other)); err != nil {
+		if _, err := isolated.Exec(ctx, "DELETE FROM auth_rate_limits WHERE key IN ($1,$2)", auth.HexDigestForTest("sms/phone/"+phone), auth.HexDigestForTest("sms/phone/"+other)); err != nil {
 			t.Fatal(err)
 		}
 		sms.stall.Store(true)
@@ -673,14 +721,9 @@ func TestAuthenticationFlow(t *testing.T) {
 
 	t.Run("SMS overload preserves the phone cooldown", func(t *testing.T) {
 		phone := map[string]string{"phone": "+923071234567"}
-		added := cap(server.smsSlots) - len(server.smsSlots)
-		for range added {
-			server.smsSlots <- struct{}{}
-		}
+		release := server.SaturateSMSForTest()
 		status, body := post("recovery/request", phone)
-		for range added {
-			<-server.smsSlots
-		}
+		release()
 		expect(t, status, 503, body)
 		status, body = post("recovery/request", phone)
 		expect(t, status, 202, body)
@@ -688,7 +731,7 @@ func TestAuthenticationFlow(t *testing.T) {
 }
 
 func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
-	handler := (&Server{}).Handler()
+	handler := httpapi.Handler(&auth.Server{})
 	for _, path := range []string{"/admin/", "/admin/app.mjs", "/api/v1/admin/onboarding", "/api/v1/admin/onboarding/document",
 		"/api/v1/admin/onboarding/decision", "/api/v1/admin/auth/login", "/api/v1/admin/audit", "/api/v1/me/driver-submission", "/api/v1/me/vehicles"} {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch} {
@@ -698,5 +741,20 @@ func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
 				t.Errorf("%s %s: %d", method, path, recorder.Code)
 			}
 		}
+	}
+}
+
+func TestHTTPMethods(t *testing.T) {
+	handler := httpapi.Handler(&auth.Server{})
+	recorder := httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/login", nil))
+	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodPost {
+		t.Fatalf("wrong-method response = %d, Allow = %q", recorder.Code, recorder.Header().Get("Allow"))
+	}
+
+	recorder = httptest.NewRecorder()
+	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodHead, "/healthz", nil))
+	if recorder.Code != http.StatusNoContent || recorder.Body.Len() != 0 {
+		t.Fatalf("HEAD /healthz = %d %s", recorder.Code, recorder.Body)
 	}
 }

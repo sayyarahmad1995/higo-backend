@@ -3,14 +3,8 @@ package auth
 import (
 	"context"
 	"crypto/cipher"
-	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"log/slog"
-	"net"
-	"net/http"
-	"strings"
 	"sync"
 	"time"
 
@@ -27,7 +21,6 @@ var (
 	unauthorized    = errors.New("unauthorized")
 	limited         = errors.New("rate_limited")
 	busy            = errors.New("temporarily_unavailable")
-	uploadTimeout   = errors.New("upload_timeout")
 )
 
 type SMS interface {
@@ -138,7 +131,8 @@ func (s *Server) cleanup(ctx context.Context) {
 	}
 }
 
-type input struct {
+// Input carries decoded values to the feature operations.
+type Input struct {
 	Phone              string               `json:"phone"`
 	Password           string               `json:"password"`
 	Name               string               `json:"name"`
@@ -154,219 +148,13 @@ type input struct {
 	OnboardingSubmit   onboardingSubmission `json:"-"`
 }
 
-type operation func(context.Context, input, string) (int, any, error)
-
-func (s *Server) Handler() http.Handler {
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusNoContent) })
-	s.route(mux, "POST", "auth/register", s.register)
-	s.route(mux, "POST", "auth/register/verify", s.verifyRegistration)
-	s.route(mux, "POST", "auth/login", s.login)
-	s.route(mux, "POST", "auth/refresh", s.refresh)
-	s.route(mux, "POST", "auth/logout", s.logout)
-	s.route(mux, "POST", "auth/recovery/request", s.requestRecovery)
-	s.route(mux, "POST", "auth/recovery/verify", s.verifyRecovery)
-	s.route(mux, "POST", "auth/recovery/reset", s.reset)
-	s.route(mux, "GET", "me", s.me)
-	s.route(mux, "PATCH", "me", s.updateProfile)
-	s.route(mux, "POST", "me/email/request", s.requestEmailVerification)
-	s.route(mux, "POST", "me/email/verify", s.verifyEmail)
-	s.route(mux, "GET", onboardingPath, s.getOnboarding)
-	s.route(mux, "PATCH", onboardingPath, s.saveOnboarding)
-	s.route(mux, "POST", onboardingPath, s.submitOnboarding)
-	s.route(mux, "POST", onboardingPath+"/document", s.saveOnboardingDocument)
-	s.route(mux, "DELETE", onboardingPath+"/document", s.removeOnboardingDocument)
-	s.route(mux, "GET", onboardingPath+"/preview", s.previewOnboardingDocument)
-	return mux
-}
-
-func (s *Server) route(mux *http.ServeMux, method, path string, run operation) {
-	mux.HandleFunc(method+" /api/v1/"+path, func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Content-Type", "application/json")
-		documentUpload := method == http.MethodPost && path == onboardingPath+"/document"
-		requestTimeout := 10 * time.Second
-		if documentUpload {
-			requestTimeout = 25 * time.Second
-			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(30 * time.Second))
-		}
-		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
-		defer cancel()
-		peer, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			peer = r.RemoteAddr
-		}
-		limit := 60
-		if path == "auth/register" || path == "auth/recovery/request" {
-			limit = 10
-		}
-		ratePath := path
-		if documentUpload {
-			ratePath = method + "/" + path
-		}
-		if err := allow(ctx, s.db, ratePath+"/ip/"+peer, time.Minute, limit); err != nil {
-			respond(w, 0, nil, err)
-			return
-		}
-		var body input
-		bearer, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if path == onboardingPath+"/preview" {
-			body.OnboardingPreview = r.URL.Query().Get("kind")
-			if _, _, err := s.me(ctx, input{}, bearer); err != nil {
-				respond(w, 0, nil, err)
-				return
-			}
-			select {
-			case s.driverDocumentSlots <- struct{}{}:
-				defer func() { <-s.driverDocumentSlots }()
-			default:
-				respond(w, 0, nil, busy)
-				return
-			}
-		}
-		if method == http.MethodDelete && path == onboardingPath+"/document" {
-			body.OnboardingDocument.Kind = r.URL.Query().Get("kind")
-			body.OnboardingDocument.Revision = r.URL.Query().Get("draft_revision")
-		}
-		if method == http.MethodPatch || (method == http.MethodPost && path != "auth/logout") {
-			var maxBytes int64 = 4096
-			var releaseUpload func()
-			var uploadStarted time.Time
-			var cooldownKey string
-			var target any = &body
-			if method == http.MethodPatch {
-				target = &body.Profile
-			}
-			if path == onboardingPath {
-				target = &body.OnboardingSubmit
-				if method == http.MethodPatch {
-					target = &body.OnboardingDraft
-				}
-			}
-			if documentUpload {
-				_, account, err := s.me(ctx, input{}, bearer)
-				if err != nil {
-					respond(w, 0, nil, err)
-					return
-				}
-				id := account.(currentUser).ID
-				cooldownKey = hexDigest(fmt.Sprintf("document/slow-upload/%d", id))
-				var coolingDown bool
-				if err := s.db.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM auth_rate_limits WHERE key=$1 AND bucket=0 AND expires_at>now())`, cooldownKey).Scan(&coolingDown); err != nil {
-					respond(w, 0, nil, err)
-					return
-				}
-				if coolingDown {
-					respond(w, 0, nil, limited)
-					return
-				}
-				maxBytes = 3 * 1024 * 1024
-				target = &body.OnboardingDocument
-				if r.ContentLength > maxBytes {
-					respond(w, 0, nil, documentTooLarge)
-					return
-				}
-				if _, active := s.activeUploadAccounts.LoadOrStore(id, struct{}{}); active {
-					respond(w, 0, nil, busy)
-					return
-				}
-				slots := s.documentUploadSlots
-				select {
-				case slots <- struct{}{}:
-					defer func() { <-slots }()
-					releaseUpload = func() { s.activeUploadAccounts.Delete(id) }
-				default:
-					s.activeUploadAccounts.Delete(id)
-					respond(w, 0, nil, busy)
-					return
-				}
-				// Limit how long a stalled client can hold an upload slot.
-				readTimeout := 20 * time.Second
-				_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(readTimeout))
-				uploadStarted = time.Now()
-			}
-			decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
-			decoder.DisallowUnknownFields()
-			decodeErr := decoder.Decode(target)
-			if decodeErr == nil {
-				decodeErr = decoder.Decode(new(any))
-				if decodeErr == io.EOF {
-					decodeErr = nil
-				} else if decodeErr == nil {
-					decodeErr = invalid
-				}
-			}
-			if documentUpload && time.Since(uploadStarted) >= 5*time.Second {
-				penaltyCtx, stop := context.WithTimeout(context.WithoutCancel(ctx), time.Second)
-				_, _ = s.db.Exec(penaltyCtx, `INSERT INTO auth_rate_limits(key,bucket,attempts,expires_at) VALUES ($1,0,1,now()+interval '60 seconds')
- ON CONFLICT (key,bucket) DO UPDATE SET expires_at=excluded.expires_at`, cooldownKey)
-				stop()
-			}
-			if decodeErr != nil {
-				if releaseUpload != nil {
-					releaseUpload()
-				}
-				var networkError net.Error
-				if documentUpload && errors.As(decodeErr, &networkError) && networkError.Timeout() {
-					respond(w, 0, nil, uploadTimeout)
-					return
-				}
-				var oversized *http.MaxBytesError
-				if errors.As(decodeErr, &oversized) && documentUpload {
-					respond(w, 0, nil, documentTooLarge)
-					return
-				}
-				respond(w, 0, nil, invalid)
-				return
-			}
-			if releaseUpload != nil {
-				releaseUpload()
-			}
-		}
-		status, result, err := run(ctx, body, bearer)
-		if path != "me" {
-			slog.Info("auth_request", "operation", path, "outcome", outcome(err))
-		}
-		respond(w, status, result, err)
-	})
-}
-
-func outcome(err error) string {
+// ErrorCode identifies domain errors safe to expose in an API response.
+func ErrorCode(err error) string {
 	switch err {
-	case nil:
-		return "success"
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, onboardingConflict, onboardingIncomplete, uploadTimeout:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, onboardingConflict, onboardingIncomplete:
 		return err.Error()
 	default:
-		return "internal_error"
-	}
-}
-
-func respond(w http.ResponseWriter, status int, result any, err error) {
-	if err != nil {
-		switch err {
-		case invalid, invalidCode, invalidRecovery, invalidDocument:
-			status = 400
-		case documentTooLarge:
-			status = 413
-		case onboardingConflict, onboardingIncomplete:
-			status = 409
-		case uploadTimeout:
-			status = 408
-		case denied, unauthorized:
-			status = 401
-		case limited:
-			status = 429
-		case busy:
-			status = 503
-		default:
-			status = 500
-		}
-		result = map[string]string{"error": outcome(err)}
-	}
-	w.WriteHeader(status)
-	if result != nil {
-		_ = json.NewEncoder(w).Encode(result)
+		return ""
 	}
 }
 

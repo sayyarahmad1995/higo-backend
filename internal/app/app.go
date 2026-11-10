@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpserver"
 	"github.com/sayyarahmad1995/higo-backend/migrations"
 )
@@ -44,5 +45,5 @@ func Run() error {
 		return err
 	}
 	defer api.Close()
-	return httpserver.Run(ctx, cfg.address, api.Handler())
+	return httpserver.Run(ctx, cfg.address, httpapi.Handler(api))
 }
