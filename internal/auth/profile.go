@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"errors"
 	"net/mail"
 	"strings"
 
@@ -14,11 +13,11 @@ type profilePatch struct {
 	Email *string `json:"email"`
 }
 
-func validProfileName(name string) bool {
+func ValidProfileName(name string) bool {
 	return len(name) > 0 && len(name) <= 150 && !strings.ContainsRune(name, 0)
 }
 
-func validProfileEmail(email string) bool {
+func ValidProfileEmail(email string) bool {
 	if email == "" {
 		return true
 	}
@@ -30,9 +29,9 @@ func validProfileEmail(email string) bool {
 }
 
 func (s *Server) UpdateProfile(ctx context.Context, body Input, bearer string) (any, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return nil, unauthorized
+	proof := NewAccessProof(bearer)
+	if err := proof.Validate(); err != nil {
+		return nil, err
 	}
 	patch := body.Profile
 	if patch.Name == nil && patch.Email == nil {
@@ -40,43 +39,32 @@ func (s *Server) UpdateProfile(ctx context.Context, body Input, bearer string) (
 	}
 	if patch.Name != nil {
 		*patch.Name = strings.TrimSpace(*patch.Name)
-		if !validProfileName(*patch.Name) {
+		if !ValidProfileName(*patch.Name) {
 			return nil, invalid
 		}
 	}
 	if patch.Email != nil {
 		*patch.Email = strings.TrimSpace(*patch.Email)
-		if !validProfileEmail(*patch.Email) {
+		if !ValidProfileEmail(*patch.Email) {
 			return nil, invalid
 		}
 	}
-	var result currentUser
+	var result Profile
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		// Match password reset's account-then-session lock order.
-		var userID int64
-		var email string
-		var emailVerified bool
-		err := tx.QueryRow(ctx, `SELECT u.id,u.email,u.email_verified_at IS NOT NULL FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
- WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>clock_timestamp()
- AND s.expires_at>clock_timestamp() FOR UPDATE OF u`, digest).Scan(&userID, &email, &emailVerified)
-		if errors.Is(err, pgx.ErrNoRows) {
-			return unauthorized
-		}
+		target, err := proof.LockProfileAccount(ctx, tx)
 		if err != nil {
 			return err
 		}
-		if patch.Email != nil && *patch.Email != email {
-			if emailVerified {
+		if patch.Email != nil && *patch.Email != target.Email {
+			if target.EmailVerified {
 				return invalid
 			}
-			if _, err := tx.Exec(ctx, `DELETE FROM auth_email_challenges WHERE user_id=$1`, userID); err != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM auth_email_challenges WHERE user_id=$1`, target.ID); err != nil {
 				return err
 			}
 		}
-		result, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET name=COALESCE($3,u.name),email=COALESCE($4,u.email)
- WHERE u.id=$2 AND EXISTS (SELECT 1 FROM auth_sessions s WHERE s.user_id=u.id AND s.access_digest=$1
- AND s.revoked_at IS NULL AND s.access_expires_at>clock_timestamp() AND s.expires_at>clock_timestamp() FOR SHARE OF s)
- RETURNING `+currentUserColumns, digest, userID, patch.Name, patch.Email))
+		result, err = proof.WriteLockedProfile(ctx, tx, target.ID, patch.Name, patch.Email)
 		return err
 	})
 	return result, err

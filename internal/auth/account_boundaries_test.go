@@ -266,6 +266,59 @@ func testAccountBoundaries(t *testing.T, db *pgxpool.Pool, handler http.Handler,
 		}
 	})
 
+	t.Run("password version change while issuance waits invalidates the verified snapshot", func(t *testing.T) {
+		resetCooldown(t)
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, "SELECT id FROM auth_users WHERE id=$1 FOR UPDATE", id); err != nil {
+			t.Fatal(err)
+		}
+		var blocker int32
+		if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&blocker); err != nil {
+			t.Fatal(err)
+		}
+		wait, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		var response *httptest.ResponseRecorder
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			response = emailRequest(wait, access, "stale-version@example.test")
+		}()
+		defer func() {
+			cancel()
+			_ = tx.Rollback(ctx)
+			<-done
+		}()
+		for {
+			var blocked bool
+			err := db.QueryRow(wait, `SELECT EXISTS (
+ SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, blocker).Scan(&blocked)
+			if err != nil {
+				t.Fatal("email request never waited for the account lock: ", err)
+			}
+			if blocked {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		// Leave the session active to isolate the version predicate from revocation.
+		if _, err := tx.Exec(ctx, "UPDATE auth_users SET password_version=password_version+1 WHERE id=$1", id); err != nil {
+			t.Fatal(err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		<-done
+		expect(t, response, 401, "unauthorized")
+		expectProfile(t, access, "verified@example.test", "", true)
+		if len(sender.testEmail) != 0 {
+			t.Fatal("provider received a stale-password challenge")
+		}
+	})
+
 	t.Run("password reset hides and invalidates an outstanding email code", func(t *testing.T) {
 		code := issue(t, access, "old-version@example.test")
 		grant, err := auth.NewTokenForTest("rc_")
