@@ -5,6 +5,7 @@ import (
 	"net/http"
 
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 )
 
 type requestError string
@@ -25,6 +26,9 @@ func outcome(err error) string {
 		return requestErr.Error()
 	}
 	if code := auth.ErrorCode(err); code != "" {
+		return code
+	}
+	if code := driver.ErrorCode(err); code != "" {
 		return code
 	}
 	return "internal_error"

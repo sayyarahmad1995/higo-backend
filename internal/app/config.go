@@ -15,6 +15,7 @@ import (
 
 type config struct {
 	auth                 auth.Config
+	driverDocumentKey    []byte
 	address, databaseURL string
 	sms                  auth.SMS
 }
@@ -46,8 +47,8 @@ func loadConfig() (config, error) {
 	}
 	cfg.auth = auth.Config{OTPKey: key, PasswordMemory: memory, PasswordPasses: passes}
 	if encoded := os.Getenv("HIGO_DRIVER_DOCUMENT_KEY"); encoded != "" {
-		cfg.auth.DriverDocumentKey, err = base64.StdEncoding.DecodeString(encoded)
-		if err != nil || len(cfg.auth.DriverDocumentKey) != 32 {
+		cfg.driverDocumentKey, err = base64.StdEncoding.DecodeString(encoded)
+		if err != nil || len(cfg.driverDocumentKey) != 32 {
 			return cfg, errors.New("HIGO_DRIVER_DOCUMENT_KEY must be 32 random bytes encoded as standard Base64")
 		}
 	}

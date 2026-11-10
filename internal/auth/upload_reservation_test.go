@@ -18,13 +18,14 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 )
 
 type uploadReaderFunc func([]byte) (int, error)
 
 func (read uploadReaderFunc) Read(p []byte) (int, error) { return read(p) }
 
-func testUploadReservations(t *testing.T, handler http.Handler, server *auth.Server, db *pgxpool.Pool, access string, accountID int64) {
+func testUploadReservations(t *testing.T, handler http.Handler, service *driver.Service, db *pgxpool.Pool, access string, accountID int64) {
 	t.Helper()
 
 	var picture bytes.Buffer
@@ -56,7 +57,7 @@ func testUploadReservations(t *testing.T, handler http.Handler, server *auth.Ser
 
 		// A successful retry alone would miss a leak of one of the two global slots.
 		for _, id := range []int64{accountID, -1} {
-			releaseAccount, releaseSlot, err := server.ReserveUpload(id)
+			releaseAccount, releaseSlot, err := service.ReserveUpload(id)
 			if err != nil {
 				t.Fatalf("upload capacity was not released: %v", err)
 			}
@@ -139,7 +140,7 @@ func testUploadReservations(t *testing.T, handler http.Handler, server *auth.Ser
 		}
 	})
 
-	t.Run("slow upload persists an account cooldown", func(t *testing.T) {
+	testCooldown := func(t *testing.T, cancelDuringRead bool) {
 		ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
 		defer cancel()
 		key := auth.HexDigestForTest(fmt.Sprintf("document/slow-upload/%d", accountID))
@@ -156,23 +157,38 @@ func testUploadReservations(t *testing.T, handler http.Handler, server *auth.Ser
 			defer timer.Stop()
 			select {
 			case <-timer.C:
+				if cancelDuringRead {
+					cancel()
+					return 0, ctx.Err()
+				}
 				return 0, io.EOF
 			case <-ctx.Done():
 				return 0, ctx.Err()
 			}
 		}), bytes.NewReader(payload))
-		expectError(t, upload(ctx, body), http.StatusConflict, "onboarding_incomplete")
+		response := upload(ctx, body)
+		if cancelDuringRead {
+			expectError(t, response, http.StatusBadRequest, "invalid_request")
+		} else {
+			expectError(t, response, http.StatusConflict, "onboarding_incomplete")
+		}
 
 		var active bool
-		err := db.QueryRow(ctx, "SELECT expires_at > now() FROM auth_rate_limits WHERE key=$1 AND bucket=0", key).Scan(&active)
+		err := db.QueryRow(t.Context(), "SELECT expires_at > now() FROM auth_rate_limits WHERE key=$1 AND bucket=0", key).Scan(&active)
 		if err != nil || !active {
 			t.Fatalf("expected an active cooldown in PostgreSQL, got active=%t, err=%v", active, err)
 		}
-		expectError(t, upload(ctx, bytes.NewReader(payload)), http.StatusTooManyRequests, "rate_limited")
+		expectError(t, upload(t.Context(), bytes.NewReader(payload)), http.StatusTooManyRequests, "rate_limited")
 
-		if _, err := db.Exec(ctx, "UPDATE auth_rate_limits SET expires_at=now() WHERE key=$1 AND bucket=0", key); err != nil {
+		if _, err := db.Exec(t.Context(), "UPDATE auth_rate_limits SET expires_at=now() WHERE key=$1 AND bucket=0", key); err != nil {
 			t.Fatal(err)
 		}
 		expectAvailable(t)
+	}
+	t.Run("slow upload persists an account cooldown", func(t *testing.T) {
+		testCooldown(t, false)
+	})
+	t.Run("slow canceled upload persists an account cooldown", func(t *testing.T) {
+		testCooldown(t, true)
 	})
 }

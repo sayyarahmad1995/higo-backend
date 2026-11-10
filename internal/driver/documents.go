@@ -1,22 +1,17 @@
-package auth
+package driver
 
 import (
 	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"errors"
+	"fmt"
 	"image"
 	"image/jpeg"
 	"image/png"
 )
 
 const maxDriverImage = 1024 * 1024
-
-const purgeSupersededDriverDocuments = `UPDATE driver_identity_submissions d SET cnic_front=NULL,cnic_back=NULL
- WHERE (d.user_id,d.version) IN (SELECT old.user_id,old.version FROM driver_identity_submissions old
- WHERE old.cnic_front IS NOT NULL AND old.submitted_at < now()-interval '30 days'
- AND EXISTS (SELECT 1 FROM driver_identity_submissions newer WHERE newer.user_id=old.user_id AND newer.version>old.version)
- ORDER BY old.submitted_at LIMIT 500)`
 
 var (
 	documentTooLarge = errors.New("document_too_large")
@@ -85,8 +80,16 @@ func normalizeDocumentImage(data []byte, limit int) ([]byte, error) {
 
 const maxVehicleDocument = 2 * 1024 * 1024
 
-const purgeSupersededVehicleDocuments = `UPDATE driver_vehicle_submissions v SET registration_image=NULL,insurance_image=NULL
- WHERE (v.user_id,v.vehicle_id,v.version) IN (SELECT old.user_id,old.vehicle_id,old.version FROM driver_vehicle_submissions old
- WHERE old.registration_image IS NOT NULL AND old.submitted_at<now()-interval '30 days'
- AND EXISTS(SELECT 1 FROM driver_vehicle_submissions newer WHERE newer.user_id=old.user_id AND newer.vehicle_id=old.vehicle_id AND newer.version>old.version)
- ORDER BY old.submitted_at LIMIT 500)`
+func onboardingDocumentAAD(id int64, version int, kind string) []byte {
+	switch kind {
+	case "cnic_front":
+		kind = "identity:front"
+	case "cnic_back":
+		kind = "identity:back"
+	case "registration":
+		kind = "vehicle:registration"
+	case "additional":
+		kind = "vehicle:insurance"
+	}
+	return []byte(fmt.Sprintf("driver-onboarding:%d:%d:%s", id, version, kind))
+}

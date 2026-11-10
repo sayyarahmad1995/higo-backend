@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
 type EmailSender interface {
@@ -37,7 +38,7 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		return nil, busy
 	}
 	account := strconv.FormatInt(id, 10)
-	if err := allow(ctx, s.db, "email/password/"+account, 15*time.Minute, 10); err != nil {
+	if err := ratelimit.Allow(ctx, s.db, "email/password/"+account, 15*time.Minute, 10); err != nil {
 		return nil, err
 	}
 	if err := s.acquireHash(); err != nil {
@@ -79,7 +80,7 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 			{"email/recipient/" + strings.ToLower(address), time.Hour, 5},
 			{"email/global", time.Minute, 60},
 		} {
-			if err := allow(ctx, tx, budget.key, budget.window, budget.limit); err != nil {
+			if err := ratelimit.Allow(ctx, tx, budget.key, budget.window, budget.limit); err != nil {
 				return err
 			}
 		}

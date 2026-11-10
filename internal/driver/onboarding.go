@@ -1,4 +1,4 @@
-package auth
+package driver
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 )
 
 var (
@@ -17,24 +18,12 @@ var (
 	onboardingRegistration = regexp.MustCompile(`^[A-Z0-9][A-Z0-9 -]{1,23}$`)
 )
 
-const purgeAbandonedOnboardingDocuments = `WITH expired AS (
- SELECT user_id,application_version FROM driver_onboarding_applications
- WHERE submitted_at IS NULL AND EXISTS (SELECT 1 FROM driver_onboarding_documents d WHERE (d.user_id,d.application_version)=(driver_onboarding_applications.user_id,driver_onboarding_applications.application_version))
- AND updated_at < now()-interval '30 days' ORDER BY updated_at LIMIT 500 FOR UPDATE SKIP LOCKED
-), removed AS (
- DELETE FROM driver_onboarding_documents d USING expired e WHERE (d.user_id,d.application_version)=(e.user_id,e.application_version)
-)
-UPDATE driver_onboarding_applications a SET cnic_front=NULL,cnic_back=NULL,
- registration_image=NULL,insurance_image=NULL,draft_revision=draft_revision+1,
- details=jsonb_set(details,'{step}','"0"')
- FROM expired e WHERE (a.user_id,a.application_version)=(e.user_id,e.application_version)`
-
-type onboardingDocument struct {
+type Document struct {
 	Revision string `json:"draft_revision"`
 	Kind     string `json:"kind"`
 	Image    []byte `json:"image"`
 }
-type onboardingSubmission struct {
+type Submission struct {
 	Revision  string `json:"draft_revision"`
 	Confirmed bool   `json:"confirmed"`
 }
@@ -68,14 +57,13 @@ func readOnboarding(ctx context.Context, tx pgx.Tx, id int64) (onboardingApplica
 	return result, nil
 }
 
-func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(pgx.Tx, int64, onboardingApplication) error) (any, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return nil, unauthorized
+func (s *Service) withOnboarding(ctx context.Context, proof auth.AccessProof, change func(pgx.Tx, int64, onboardingApplication) error) (any, error) {
+	if err := proof.Validate(); err != nil {
+		return nil, err
 	}
 	var result onboardingApplication
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		id, err := lockSessionAccount(ctx, tx, digest)
+		id, err := proof.LockAccount(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -92,8 +80,8 @@ func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(
 	return result, err
 }
 
-func (s *Server) GetOnboarding(ctx context.Context, _ Input, bearer string) (any, error) {
-	return s.withOnboarding(ctx, bearer, nil)
+func (s *Service) GetOnboarding(ctx context.Context, proof auth.AccessProof) (any, error) {
+	return s.withOnboarding(ctx, proof, nil)
 }
 
 func completeVehicle(details map[string]string) bool {
@@ -102,23 +90,23 @@ func completeVehicle(details map[string]string) bool {
 		return false
 	}
 	for _, key := range []string{"make", "model", "color"} {
-		if !validProfileName(details[key]) || len(details[key]) > 80 {
+		if !validDriverName(details[key]) || len(details[key]) > 80 {
 			return false
 		}
 	}
 	return true
 }
 
-func (s *Server) SaveOnboarding(ctx context.Context, body Input, bearer string) (any, error) {
-	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
-		if body.OnboardingDraft == nil {
+func (s *Service) SaveOnboarding(ctx context.Context, proof auth.AccessProof, draft map[string]string) (any, error) {
+	return s.withOnboarding(ctx, proof, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+		if draft == nil {
 			return invalid
 		}
-		if current.SubmittedAt != nil || body.OnboardingDraft["revision"] != current.Draft["revision"] {
+		if current.SubmittedAt != nil || draft["revision"] != current.Draft["revision"] {
 			return onboardingConflict
 		}
 		details := make(map[string]string)
-		for key, value := range body.OnboardingDraft {
+		for key, value := range draft {
 			switch key {
 			case "revision":
 				continue // Server-derived values.
@@ -171,15 +159,15 @@ func (s *Server) SaveOnboarding(ctx context.Context, body Input, bearer string) 
 	})
 }
 
-func (s *Server) SubmitOnboarding(ctx context.Context, body Input, bearer string) (any, error) {
-	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
-		if body.OnboardingSubmit.Revision != current.Draft["revision"] {
+func (s *Service) SubmitOnboarding(ctx context.Context, proof auth.AccessProof, submission Submission) (any, error) {
+	return s.withOnboarding(ctx, proof, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+		if submission.Revision != current.Draft["revision"] {
 			return onboardingConflict
 		}
 		if current.SubmittedAt != nil {
 			return nil
 		} // Retry after an uncertain response.
-		if !body.OnboardingSubmit.Confirmed || current.Draft["step"] != "3" || !completeDriver(current.Draft, onboardingToday()) ||
+		if !submission.Confirmed || current.Draft["step"] != "3" || !completeDriver(current.Draft, onboardingToday()) ||
 			!completeVehicle(current.Draft) || !completeEvidence(current.Draft, current.Documents, onboardingToday()) {
 			return onboardingIncomplete
 		}
@@ -187,4 +175,9 @@ func (s *Server) SubmitOnboarding(ctx context.Context, body Input, bearer string
  WHERE user_id=$1 AND application_version=$2 AND submitted_at IS NULL`, id, current.Version)
 		return err
 	})
+}
+
+// validDriverName applies the existing byte and NUL bounds to Driver fields.
+func validDriverName(name string) bool {
+	return len(name) > 0 && len(name) <= 150 && !strings.ContainsRune(name, 0)
 }
