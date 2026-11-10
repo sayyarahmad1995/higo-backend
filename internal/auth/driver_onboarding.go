@@ -69,13 +69,13 @@ func readOnboarding(ctx context.Context, tx pgx.Tx, id int64) (onboardingApplica
 }
 
 func (s *Server) withOnboarding(ctx context.Context, bearer string, change func(pgx.Tx, int64, onboardingApplication) error) (any, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return nil, unauthorized
+	proof := NewAccessProof(bearer)
+	if err := proof.Validate(); err != nil {
+		return nil, err
 	}
 	var result onboardingApplication
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		id, err := lockSessionAccount(ctx, tx, digest)
+		id, err := proof.LockAccount(ctx, tx)
 		if err != nil {
 			return err
 		}

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
 type sessionTokens struct {
@@ -48,7 +49,7 @@ func (s *Server) Login(ctx context.Context, body Input, _ string) (any, error) {
 	if phone == "" || !validPassword(body.Password) {
 		return nil, denied
 	}
-	if err := allow(ctx, s.db, "login/phone/"+phone, 15*time.Minute, 10); err != nil {
+	if err := ratelimit.Allow(ctx, s.db, "login/phone/"+phone, 15*time.Minute, 10); err != nil {
 		return nil, err
 	}
 	var user, version int64
@@ -161,13 +162,16 @@ func (s *Server) Me(ctx context.Context, _ Input, bearer string) (any, error) {
 }
 
 func (s *Server) currentAccount(ctx context.Context, bearer string) (currentUser, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return currentUser{}, unauthorized
+	return s.accountForProof(ctx, NewAccessProof(bearer))
+}
+
+func (s *Server) accountForProof(ctx context.Context, proof AccessProof) (currentUser, error) {
+	if err := proof.Validate(); err != nil {
+		return currentUser{}, err
 	}
 	return scanCurrentUser(s.db.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_sessions s
  JOIN auth_users u ON u.id=s.user_id WHERE s.access_digest=$1 AND s.revoked_at IS NULL
- AND s.access_expires_at>now() AND s.expires_at>now()`, digest))
+ AND s.access_expires_at>now() AND s.expires_at>now()`, proof.digest))
 }
 
 const currentUserColumns = `u.id,u.phone,u.name,u.email,u.has_driver_capability,u.email_verified_at IS NOT NULL,

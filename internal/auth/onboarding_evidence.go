@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
 var requiredOnboardingDocuments = []string{
@@ -149,7 +150,7 @@ func (s *Server) SaveOnboardingDocument(ctx context.Context, body Input, bearer 
 		if current.Draft["revision"] != doc.Revision {
 			return onboardingConflict
 		}
-		if err := allow(ctx, tx, fmt.Sprintf("onboarding/document-changes/%d", id), 15*time.Minute, 40); err != nil {
+		if err := ratelimit.Allow(ctx, tx, fmt.Sprintf("onboarding/document-changes/%d", id), 15*time.Minute, 40); err != nil {
 			return err
 		}
 		encrypted := s.driverDocumentCipher.Seal(nil, nil, normalized, aad)

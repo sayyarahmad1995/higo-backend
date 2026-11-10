@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
 var (
@@ -19,7 +19,7 @@ var (
 	invalidRecovery = errors.New("invalid_or_expired_recovery_token")
 	denied          = errors.New("invalid_credentials")
 	unauthorized    = errors.New("unauthorized")
-	limited         = errors.New("rate_limited")
+	limited         = ratelimit.ErrLimited
 	busy            = errors.New("temporarily_unavailable")
 )
 
@@ -158,22 +158,6 @@ func ErrorCode(err error) string {
 	}
 }
 
-type rateExecutor interface {
-	Exec(context.Context, string, ...any) (pgconn.CommandTag, error)
-}
-
-func allow(ctx context.Context, db rateExecutor, key string, window time.Duration, limit int) error {
-	seconds := int64(window / time.Second)
-	tag, err := db.Exec(ctx, `INSERT INTO auth_rate_limits (key,bucket,attempts,expires_at)
- SELECT $1, floor(extract(epoch FROM now())/$2::bigint)::bigint, 1, now()+$2::bigint*interval '2 seconds'
- ON CONFLICT (key,bucket) DO UPDATE SET attempts=auth_rate_limits.attempts+1 WHERE auth_rate_limits.attempts<$3`,
-		hexDigest(key), seconds, limit)
-	if err == nil && tag.RowsAffected() == 0 {
-		return limited
-	}
-	return err
-}
-
 func (s *Server) reserveSMS(ctx context.Context, purpose, phone string) error {
 	return pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `INSERT INTO auth_rate_limits (key,bucket,attempts,expires_at)
@@ -186,10 +170,10 @@ func (s *Server) reserveSMS(ctx context.Context, purpose, phone string) error {
 		if tag.RowsAffected() == 0 {
 			return limited
 		}
-		if err := allow(ctx, tx, purpose+"/phone/"+phone, time.Hour, 5); err != nil {
+		if err := ratelimit.Allow(ctx, tx, purpose+"/phone/"+phone, time.Hour, 5); err != nil {
 			return err
 		}
-		return allow(ctx, tx, "sms/global", time.Minute, 60)
+		return ratelimit.Allow(ctx, tx, "sms/global", time.Minute, 60)
 	})
 }
 

@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"fmt"
+	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 	"time"
 )
 
@@ -12,7 +13,7 @@ func (s *Server) AllowRequest(ctx context.Context, operation, peer string) error
 	if operation == "auth/register" || operation == "auth/recovery/request" {
 		limit = 10
 	}
-	return allow(ctx, s.db, operation+"/ip/"+peer, time.Minute, limit)
+	return ratelimit.Allow(ctx, s.db, operation+"/ip/"+peer, time.Minute, limit)
 }
 
 // ReservePreview authenticates the caller before acquiring a document slot.
