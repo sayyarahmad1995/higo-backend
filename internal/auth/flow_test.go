@@ -19,6 +19,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
 	"github.com/sayyarahmad1995/higo-backend/migrations"
 )
@@ -84,12 +85,16 @@ func TestAuthenticationFlow(t *testing.T) {
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	emails := make(testEmail, 4)
-	server, err := auth.New(ctx, isolated, sms, auth.Config{DriverDocumentKey: bytes.Repeat([]byte{8}, 32), EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	driverService, err := driver.New(isolated, bytes.Repeat([]byte{8}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := auth.New(ctx, isolated, sms, auth.Config{PurgeDriverDocuments: driverService.PurgeDocuments, EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	handler := httpapi.Handler(server)
+	handler := httpapi.Handler(server, driverService)
 	peer := "192.0.2.1:12345"
 	call := func(method, path, bearer string, body any) (int, map[string]any) {
 		data, _ := json.Marshal(body)
@@ -209,10 +214,10 @@ func TestAuthenticationFlow(t *testing.T) {
 		t.Fatal("wrong current user")
 	}
 	t.Run("upload reservation boundary", func(t *testing.T) {
-		testUploadReservations(t, handler, server, isolated, access, int64(body["id"].(float64)))
+		testUploadReservations(t, handler, driverService, isolated, access, int64(body["id"].(float64)))
 	})
 	t.Run("Driver transaction boundaries", func(t *testing.T) {
-		testDriverTransactions(t, isolated, handler, server, int64(body["id"].(float64)), oldPassword)
+		testDriverTransactions(t, isolated, handler, driverService, int64(body["id"].(float64)), access, oldPassword)
 	})
 	t.Run("redesigned onboarding is resumable, bounded and immutable", func(t *testing.T) {
 		const path = "me/driver-application"
@@ -235,8 +240,8 @@ func TestAuthenticationFlow(t *testing.T) {
 		draft["step"] = "1"
 		update(http.MethodPatch, path, draft, 409)
 		upload("selfie", []byte("bad image"), 400)
-		upload("selfie", make([]byte, auth.MaxVehicleDocumentForTest+1), 413)
-		upload("selfie", make([]byte, 3*auth.MaxVehicleDocumentForTest), 413)
+		upload("selfie", make([]byte, (2*1024*1024)+1), 413)
+		upload("selfie", make([]byte, 3*(2*1024*1024)), 413)
 		apply(upload("selfie", picture.Bytes(), 200))
 		savedRevision := draft["revision"]
 		retry := update(http.MethodPost, path+"/document", map[string]any{
@@ -279,8 +284,8 @@ func TestAuthenticationFlow(t *testing.T) {
 		expect(t, a.status, 200, a.body)
 		expect(t, b.status, 409, b.body)
 		apply(a.body)
-		upload("cnic_front", make([]byte, auth.MaxDriverImageForTest+1), 413)
-		for _, kind := range auth.RequiredOnboardingDocumentsForTest[1:] {
+		upload("cnic_front", make([]byte, (1024*1024)+1), 413)
+		for _, kind := range requiredDriverKinds[1:] {
 			apply(upload(kind, picture.Bytes(), 200))
 		}
 		apply(upload("additional", picture.Bytes(), 200))
@@ -322,13 +327,13 @@ func TestAuthenticationFlow(t *testing.T) {
 			if err := rows.Scan(&id, &kind, &encrypted); err != nil {
 				t.Fatal(err)
 			}
-			data, err := server.OpenDocumentForTest(encrypted, id, 1, kind)
+			data, err := openBaselineEvidence(t, id, 1, kind, encrypted)
 			if err != nil || !bytes.HasPrefix(data, picture.Bytes()[:8]) || bytes.HasPrefix(encrypted, picture.Bytes()[:8]) {
 				t.Fatalf("encryption of %s: %v", kind, err)
 			}
 			count++
 		}
-		if err := rows.Err(); err != nil || count != len(auth.RequiredOnboardingDocumentsForTest) {
+		if err := rows.Err(); err != nil || count != len(requiredDriverKinds) {
 			t.Fatalf("evidence count %d: %v", count, err)
 		}
 		status, body = call(http.MethodGet, "me", restored, nil)
@@ -486,9 +491,7 @@ func TestAuthenticationFlow(t *testing.T) {
  INSERT INTO driver_onboarding_documents SELECT user_id,application_version,'selfie',decode(repeat('01',29),'hex') FROM draft`); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := isolated.Exec(ctx, auth.PurgeAbandonedOnboardingDocumentsForTest); err != nil {
-			t.Fatal(err)
-		}
+		driverService.PurgeDocuments(ctx)
 		status, body = call(http.MethodGet, "me/driver-application", otherAccess, nil)
 		expect(t, status, 200, body)
 		if draft := body["draft"].(map[string]any); len(body["documents"].([]any)) != 0 || draft["legal_name"] != "Other Applicant" || draft["revision"] != "2" {
@@ -725,7 +728,7 @@ func TestAuthenticationFlow(t *testing.T) {
 }
 
 func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
-	handler := httpapi.Handler(&auth.Server{})
+	handler := httpapi.Handler(&auth.Server{}, &driver.Service{})
 	for _, path := range []string{"/admin/", "/admin/app.mjs", "/api/v1/admin/onboarding", "/api/v1/admin/onboarding/document",
 		"/api/v1/admin/onboarding/decision", "/api/v1/admin/auth/login", "/api/v1/admin/audit", "/api/v1/me/driver-submission", "/api/v1/me/vehicles"} {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch} {
@@ -739,7 +742,7 @@ func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
 }
 
 func TestHTTPMethods(t *testing.T) {
-	handler := httpapi.Handler(&auth.Server{})
+	handler := httpapi.Handler(&auth.Server{}, &driver.Service{})
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/login", nil))
 	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodPost {

@@ -34,7 +34,7 @@ func (a api) decodeUpload(ctx context.Context, w http.ResponseWriter, r *http.Re
 	started := time.Now()
 	err := decodeJSON(w, r, maxUploadBytes, target)
 	if time.Since(started) >= 5*time.Second {
-		a.auth.RecordSlowUpload(ctx, id)
+		a.driver.RecordSlowUpload(ctx, id)
 	}
 
 	releaseAccount()

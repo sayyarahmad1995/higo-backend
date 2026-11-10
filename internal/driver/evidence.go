@@ -1,4 +1,4 @@
-package auth
+package driver
 
 import (
 	"bytes"
@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
@@ -27,7 +28,7 @@ func onboardingToday() time.Time {
 func completeDriver(d map[string]string, today time.Time) bool {
 	dob, err := time.Parse(time.DateOnly, d["date_of_birth"])
 	return err == nil && dob.Year() > 0 && !dob.AddDate(18, 0, 0).After(today) &&
-		validProfileName(d["legal_name"]) && onboardingCNIC.MatchString(d["cnic_number"])
+		validDriverName(d["legal_name"]) && onboardingCNIC.MatchString(d["cnic_number"])
 }
 
 func hasDocument(kinds []string, kind string) bool { return slices.Contains(kinds, kind) }
@@ -89,22 +90,7 @@ func completeEvidence(d map[string]string, kinds []string, today time.Time) bool
 		(!hasDocument(kinds, "additional") || validDocumentDate(d, "additional", "no_expiry", today))
 }
 
-func onboardingDocumentAAD(id int64, version int, kind string) []byte {
-	switch kind {
-	case "cnic_front":
-		kind = "identity:front"
-	case "cnic_back":
-		kind = "identity:back"
-	case "registration":
-		kind = "vehicle:registration"
-	case "additional":
-		kind = "vehicle:insurance"
-	}
-	return []byte(fmt.Sprintf("driver-onboarding:%d:%d:%s", id, version, kind))
-}
-
-func (s *Server) SaveOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
-	doc := body.OnboardingDocument
+func (s *Service) SaveOnboardingDocument(ctx context.Context, proof auth.AccessProof, doc Document) (any, error) {
 	if !hasDocument(requiredOnboardingDocuments, doc.Kind) && doc.Kind != "additional" {
 		return nil, invalid
 	}
@@ -125,7 +111,7 @@ func (s *Server) SaveOnboardingDocument(ctx context.Context, body Input, bearer 
 	if err != nil {
 		return nil, err
 	}
-	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+	return s.withOnboarding(ctx, proof, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if current.SubmittedAt != nil {
 			return onboardingConflict
 		}
@@ -164,42 +150,41 @@ func (s *Server) SaveOnboardingDocument(ctx context.Context, body Input, bearer 
 	})
 }
 
-func (s *Server) PreviewOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
+func (s *Service) PreviewOnboardingDocument(ctx context.Context, proof auth.AccessProof, kind string) (any, error) {
 	if s.driverDocumentCipher == nil {
 		return nil, busy
 	}
-	if !hasDocument(requiredOnboardingDocuments, body.OnboardingPreview) && body.OnboardingPreview != "additional" {
+	if !hasDocument(requiredOnboardingDocuments, kind) && kind != "additional" {
 		return nil, invalid
 	}
 	var plain []byte
-	_, err := s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+	_, err := s.withOnboarding(ctx, proof, func(tx pgx.Tx, id int64, current onboardingApplication) error {
 		if current.SubmittedAt != nil {
 			return onboardingConflict
 		}
 		var data []byte
-		err := tx.QueryRow(ctx, `SELECT image FROM driver_onboarding_documents WHERE user_id=$1 AND application_version=$2 AND kind=$3`, id, current.Version, body.OnboardingPreview).Scan(&data)
+		err := tx.QueryRow(ctx, `SELECT image FROM driver_onboarding_documents WHERE user_id=$1 AND application_version=$2 AND kind=$3`, id, current.Version, kind).Scan(&data)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return invalid
 		}
 		if err != nil {
 			return err
 		}
-		plain, err = s.driverDocumentCipher.Open(nil, nil, data, onboardingDocumentAAD(id, current.Version, body.OnboardingPreview))
+		plain, err = s.driverDocumentCipher.Open(nil, nil, data, onboardingDocumentAAD(id, current.Version, kind))
 		return err
 	})
 	return map[string][]byte{"image": plain}, err
 }
 
-func (s *Server) RemoveOnboardingDocument(ctx context.Context, body Input, bearer string) (any, error) {
-	doc := body.OnboardingDocument
-	if doc.Kind != "additional" {
+func (s *Service) RemoveOnboardingDocument(ctx context.Context, proof auth.AccessProof, kind, revision string) (any, error) {
+	if kind != "additional" {
 		return nil, invalid
 	}
-	return s.withOnboarding(ctx, bearer, func(tx pgx.Tx, id int64, current onboardingApplication) error {
-		if current.SubmittedAt != nil || current.Draft["revision"] != doc.Revision {
+	return s.withOnboarding(ctx, proof, func(tx pgx.Tx, id int64, current onboardingApplication) error {
+		if current.SubmittedAt != nil || current.Draft["revision"] != revision {
 			return onboardingConflict
 		}
-		if !hasDocument(current.Documents, doc.Kind) {
+		if !hasDocument(current.Documents, kind) {
 			return nil
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM driver_onboarding_documents

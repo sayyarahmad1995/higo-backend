@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpserver"
 	"github.com/sayyarahmad1995/higo-backend/migrations"
@@ -40,10 +41,15 @@ func Run() error {
 	if err := migrations.Apply(startup, db); err != nil {
 		return fmt.Errorf("migration failed: %w", err)
 	}
+	driverService, err := driver.New(db, cfg.driverDocumentKey)
+	if err != nil {
+		return err
+	}
+	cfg.auth.PurgeDriverDocuments = driverService.PurgeDocuments
 	api, err := auth.New(ctx, db, cfg.sms, cfg.auth)
 	if err != nil {
 		return err
 	}
 	defer api.Close()
-	return httpserver.Run(ctx, cfg.address, httpapi.Handler(api))
+	return httpserver.Run(ctx, cfg.address, httpapi.Handler(api, driverService))
 }

@@ -14,14 +14,27 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"crypto/rand"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 )
 
 const driverPath = "/api/v1/me/driver-application"
 
-func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler, server *auth.Server, sourceID int64, password string) {
+type heldPreviewResponse struct {
+	*httptest.ResponseRecorder
+	onHeader func()
+}
+
+func (w *heldPreviewResponse) WriteHeader(status int) {
+	w.onHeader()
+	w.ResponseRecorder.WriteHeader(status)
+}
+
+func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler, service *driver.Service, sourceID int64, sourceAccess, password string) {
 	t.Helper()
 	ctx := t.Context()
 	var id int64
@@ -34,12 +47,15 @@ func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler
 			t.Error(err)
 		}
 	})
-	request := func(method, path, bearer string, body io.Reader) *httptest.ResponseRecorder {
+	newRequest := func(ctx context.Context, method, path, bearer string, body io.Reader) *http.Request {
 		req := httptest.NewRequestWithContext(ctx, method, path, body)
 		req.RemoteAddr = "192.0.2.50:12345"
 		req.Header.Set("Authorization", "Bearer "+bearer)
+		return req
+	}
+	request := func(method, path, bearer string, body io.Reader) *httptest.ResponseRecorder {
 		recorder := httptest.NewRecorder()
-		handler.ServeHTTP(recorder, req)
+		handler.ServeHTTP(recorder, newRequest(ctx, method, path, bearer, body))
 		return recorder
 	}
 	expect := func(t *testing.T, response *httptest.ResponseRecorder, status int, code string) {
@@ -110,15 +126,67 @@ func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler
 		access = login(t)
 	})
 
-	t.Run("preview and image processing share both slots", func(t *testing.T) {
-		for range 2 {
-			release, err := server.ReservePreview(ctx, access)
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer release()
+	t.Run("canceled Driver request waiting on the account lock leaves draft unchanged", func(t *testing.T) {
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
-		expect(t, request(http.MethodPost, driverPath+"/document", access, uploadBody(imageData, "1")), http.StatusServiceUnavailable, "temporarily_unavailable")
+		defer tx.Rollback(ctx)
+		if _, err := tx.Exec(ctx, "SELECT id FROM auth_users WHERE id=$1 FOR UPDATE", id); err != nil {
+			t.Fatal(err)
+		}
+		var blocker int32
+		if err := tx.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&blocker); err != nil {
+			t.Fatal(err)
+		}
+		wait, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		var result *httptest.ResponseRecorder
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			result = httptest.NewRecorder()
+			handler.ServeHTTP(result, newRequest(wait, http.MethodPatch, driverPath, access, strings.NewReader(`{"revision":"1","step":"0"}`)))
+		}()
+		defer func() {
+			cancel()
+			_ = tx.Rollback(ctx)
+			<-done
+		}()
+		for {
+			var blocked bool
+			err := db.QueryRow(wait, `SELECT EXISTS (
+ SELECT 1 FROM pg_stat_activity WHERE $1=ANY(pg_blocking_pids(pid)))`, blocker).Scan(&blocked)
+			if err != nil {
+				t.Fatal("Driver request never waited for the account lock: ", err)
+			}
+			if blocked {
+				break
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(5 * time.Second):
+			t.Fatal("Driver request did not exit after cancellation")
+		}
+		expect(t, result, http.StatusInternalServerError, "internal_error")
+		assertDraft(t, 1, 0, false)
+	})
+
+	t.Run("preview responses from two accounts occupy both processing slots", func(t *testing.T) {
+		// Writing a preview response happens before its processing slot is released.
+		// Nest the requests at that point to keep both slots held deterministically.
+		preview := func(token string, onHeader func()) {
+			response := &heldPreviewResponse{ResponseRecorder: httptest.NewRecorder(), onHeader: onHeader}
+			handler.ServeHTTP(response, newRequest(ctx, http.MethodGet, driverPath+"/preview?kind=selfie", token, nil))
+			expect(t, response.ResponseRecorder, http.StatusBadRequest, "invalid_request")
+		}
+		preview(sourceAccess, func() {
+			preview(access, func() {
+				expect(t, request(http.MethodPost, driverPath+"/document", access, uploadBody(imageData, "1")), http.StatusServiceUnavailable, "temporarily_unavailable")
+			})
+		})
 		assertDraft(t, 1, 0, false)
 	})
 
@@ -174,6 +242,13 @@ func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler
 		}
 	})
 
+	t.Run("evidence operations are scoped to the authenticated account", func(t *testing.T) {
+		expect(t, request(http.MethodGet, driverPath+"/preview?kind=selfie", sourceAccess, nil), http.StatusBadRequest, "invalid_request")
+		expect(t, request(http.MethodPost, driverPath+"/document", sourceAccess, uploadBody(imageData, "2")), http.StatusConflict, "onboarding_incomplete")
+		expect(t, request(http.MethodDelete, driverPath+"/document?kind=additional&draft_revision=2", sourceAccess, nil), http.StatusConflict, "onboarding_conflict")
+		assertDraft(t, 2, 5, false)
+	})
+
 	t.Run("failed submission keeps the draft and evidence available", func(t *testing.T) {
 		exec(t, `UPDATE driver_onboarding_applications SET details='{"step":"3","legal_name":"Driver Fixture",
  "date_of_birth":"1990-01-01","cnic_number":"1234567890123","make":"Test","model":"Car","color":"Black",
@@ -207,9 +282,8 @@ func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler
 		exec(t, `INSERT INTO driver_vehicle_submissions(user_id,vehicle_id,version,make,model,manufacture_year,color,registration_number,registration_image,insurance_image,submitted_at)
  VALUES($1,1,1,'Test','Car',2020,'Black','ABC-123',$2,$2,now()-interval '31 days'),
  ($1,1,2,'Test','Car',2020,'Black','ABC-123',$2,$2,now())`, id, ciphertext)
-		for _, statement := range auth.DriverPurgeStatementsForTest {
-			exec(t, statement)
-		}
+		exec(t, "UPDATE driver_onboarding_applications SET updated_at=now()-interval '31 days' WHERE user_id=$1 AND application_version=1", id)
+		service.PurgeDocuments(ctx)
 		assertDraft(t, 2, 13, true)
 		var purged bool
 		err := db.QueryRow(ctx, `SELECT
@@ -224,9 +298,13 @@ func testDriverTransactions(t *testing.T, db *pgxpool.Pool, handler http.Handler
 	})
 }
 
+var requiredDriverKinds = []string{
+	"selfie", "cnic_front", "cnic_back", "license_front", "license_back", "registration",
+	"exterior_front", "exterior_rear", "exterior_right", "exterior_left", "interior_front", "interior_rear",
+}
+
 // Baseline storage prepends the 12-byte nonce to standard AES-GCM ciphertext.
-// This fixture derives nonce and AAD independently of the production helpers.
-func sealBaselineEvidence(t *testing.T, id int64, version int, kind string, image []byte) []byte {
+func baselineEvidenceCipher(t *testing.T) cipher.AEAD {
 	t.Helper()
 	block, err := aes.NewCipher(bytes.Repeat([]byte{8}, 32))
 	if err != nil {
@@ -236,10 +314,41 @@ func sealBaselineEvidence(t *testing.T, id int64, version int, kind string, imag
 	if err != nil {
 		t.Fatal(err)
 	}
-	aad := []byte(fmt.Sprintf("driver-onboarding:%d:%d:%s", id, version, kind))
+	return gcm
+}
+
+func baselineEvidenceAAD(id int64, version int, alias string) []byte {
+	return []byte(fmt.Sprintf("driver-onboarding:%d:%d:%s", id, version, alias))
+}
+
+func sealBaselineEvidence(t *testing.T, id int64, version int, alias string, image []byte) []byte {
+	t.Helper()
+	gcm := baselineEvidenceCipher(t)
+	aad := baselineEvidenceAAD(id, version, alias)
 	nonce := make([]byte, gcm.NonceSize())
-	for i, c := range aad {
-		nonce[i%len(nonce)] ^= c
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatal(err)
 	}
 	return gcm.Seal(bytes.Clone(nonce), nonce, image, aad)
+}
+
+func openBaselineEvidence(t *testing.T, id int64, version int, kind string, encrypted []byte) ([]byte, error) {
+	t.Helper()
+	alias := kind
+	switch kind {
+	case "cnic_front":
+		alias = "identity:front"
+	case "cnic_back":
+		alias = "identity:back"
+	case "registration":
+		alias = "vehicle:registration"
+	case "additional":
+		alias = "vehicle:insurance"
+	}
+	gcm := baselineEvidenceCipher(t)
+	size := gcm.NonceSize()
+	if len(encrypted) < size {
+		return nil, fmt.Errorf("truncated evidence")
+	}
+	return gcm.Open(nil, encrypted[:size], encrypted[size:], baselineEvidenceAAD(id, version, alias))
 }

@@ -2,7 +2,6 @@ package auth
 
 import (
 	"context"
-	"crypto/cipher"
 	"errors"
 	"log/slog"
 	"sync"
@@ -28,28 +27,24 @@ type SMS interface {
 }
 
 type Config struct {
-	DriverDocumentKey              []byte
+	PurgeDriverDocuments           func(context.Context)
 	EmailSender                    EmailSender
 	OTPKey                         []byte
 	PasswordMemory, PasswordPasses uint32
 }
 
 type Server struct {
-	driverDocumentCipher cipher.AEAD
-	driverDocumentSlots  chan struct{}
-	documentUploadSlots  chan struct{}
-	activeUploadAccounts sync.Map
-	emailSender          EmailSender
-	db                   *pgxpool.Pool
-	sms                  SMS
-	passwords            passwords
-	otpKey               []byte
-	dummyHash            string
-	hashSlots            chan struct{}
-	deliveryContext      context.Context
-	smsSlots             chan struct{}
-	cancel               context.CancelFunc
-	worker               sync.WaitGroup
+	emailSender     EmailSender
+	db              *pgxpool.Pool
+	sms             SMS
+	passwords       passwords
+	otpKey          []byte
+	dummyHash       string
+	hashSlots       chan struct{}
+	deliveryContext context.Context
+	smsSlots        chan struct{}
+	cancel          context.CancelFunc
+	worker          sync.WaitGroup
 }
 
 type delivery struct {
@@ -70,14 +65,8 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 	ctx, cancel := context.WithCancel(ctx)
 	s := &Server{db: db, sms: sms, emailSender: cfg.EmailSender, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
 		hashSlots: make(chan struct{}, 2), deliveryContext: ctx, smsSlots: make(chan struct{}, 32), cancel: cancel}
-	s.driverDocumentCipher, err = newDriverDocumentCipher(cfg.DriverDocumentKey)
-	if err != nil {
-		cancel()
-		return nil, err
-	}
-	s.driverDocumentSlots = make(chan struct{}, 2)
-	s.documentUploadSlots = make(chan struct{}, 2)
-	s.worker.Go(func() { s.cleanup(ctx) })
+	purgeDriverDocuments := cfg.PurgeDriverDocuments
+	s.worker.Go(func() { s.cleanup(ctx, purgeDriverDocuments) })
 	return s, nil
 }
 
@@ -102,27 +91,22 @@ func (s *Server) dispatchSMS(item delivery) {
 	})
 }
 
-func (s *Server) cleanup(ctx context.Context) {
+func (s *Server) cleanup(ctx context.Context, purgeDriverDocuments func(context.Context)) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
-		for _, statement := range []string{
+		s.cleanupStatements(ctx,
 			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
 			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
-			purgeSupersededDriverDocuments,
-			purgeSupersededVehicleDocuments,
-			purgeAbandonedOnboardingDocuments,
+		)
+		if purgeDriverDocuments != nil {
+			purgeDriverDocuments(ctx)
+		}
+		s.cleanupStatements(ctx,
 			`DELETE FROM auth_recovery WHERE expires_at<=now()`,
 			`DELETE FROM auth_sessions WHERE expires_at<=now()`,
 			`DELETE FROM auth_rate_limits WHERE expires_at<=now()`,
-		} {
-			deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
-			_, err := s.db.Exec(deadline, statement)
-			cancel()
-			if err != nil && ctx.Err() == nil {
-				slog.Warn("auth_cleanup_failed")
-			}
-		}
+		)
 		select {
 		case <-ctx.Done():
 			return
@@ -131,27 +115,34 @@ func (s *Server) cleanup(ctx context.Context) {
 	}
 }
 
+func (s *Server) cleanupStatements(ctx context.Context, statements ...string) {
+	for _, statement := range statements {
+		deadline, cancel := context.WithTimeout(ctx, 10*time.Second)
+		_, err := s.db.Exec(deadline, statement)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			slog.Warn("auth_cleanup_failed")
+		}
+	}
+}
+
 // Input carries decoded values to the feature operations.
 type Input struct {
-	Phone              string               `json:"phone"`
-	Password           string               `json:"password"`
-	Name               string               `json:"name"`
-	Email              string               `json:"email"`
-	Challenge          string               `json:"challenge"`
-	Code               string               `json:"code"`
-	Refresh            string               `json:"refresh_token"`
-	Recovery           string               `json:"recovery_token"`
-	Profile            profilePatch         `json:"-"`
-	OnboardingDraft    map[string]string    `json:"-"`
-	OnboardingDocument onboardingDocument   `json:"-"`
-	OnboardingPreview  string               `json:"-"`
-	OnboardingSubmit   onboardingSubmission `json:"-"`
+	Phone     string       `json:"phone"`
+	Password  string       `json:"password"`
+	Name      string       `json:"name"`
+	Email     string       `json:"email"`
+	Challenge string       `json:"challenge"`
+	Code      string       `json:"code"`
+	Refresh   string       `json:"refresh_token"`
+	Recovery  string       `json:"recovery_token"`
+	Profile   profilePatch `json:"-"`
 }
 
 // ErrorCode identifies domain errors safe to expose in an API response.
 func ErrorCode(err error) string {
 	switch err {
-	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy, documentTooLarge, invalidDocument, onboardingConflict, onboardingIncomplete:
+	case invalid, invalidCode, invalidRecovery, denied, unauthorized, limited, busy:
 		return err.Error()
 	default:
 		return ""
