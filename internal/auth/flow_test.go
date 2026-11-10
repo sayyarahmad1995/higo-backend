@@ -211,6 +211,9 @@ func TestAuthenticationFlow(t *testing.T) {
 	t.Run("upload reservation boundary", func(t *testing.T) {
 		testUploadReservations(t, handler, server, isolated, access, int64(body["id"].(float64)))
 	})
+	t.Run("Driver transaction boundaries", func(t *testing.T) {
+		testDriverTransactions(t, isolated, handler, server, int64(body["id"].(float64)), oldPassword)
+	})
 	t.Run("redesigned onboarding is resumable, bounded and immutable", func(t *testing.T) {
 		const path = "me/driver-application"
 		var picture bytes.Buffer

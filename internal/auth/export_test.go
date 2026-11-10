@@ -30,3 +30,9 @@ func (s *Server) SaturateSMSForTest() func() {
 		}
 	}
 }
+
+var DriverPurgeStatementsForTest = []string{
+	purgeSupersededDriverDocuments,
+	purgeSupersededVehicleDocuments,
+	purgeAbandonedOnboardingDocuments,
+}
