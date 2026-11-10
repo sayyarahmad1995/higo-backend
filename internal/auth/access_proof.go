@@ -2,6 +2,7 @@ package auth
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -38,6 +39,24 @@ func (p AccessProof) LockAccount(ctx context.Context, tx pgx.Tx) (int64, error) 
 // ResolveAccount checks the live session for request admission. Callers must
 // use LockAccount in their own transaction before accessing account-owned data.
 func (s *Server) ResolveAccount(ctx context.Context, proof AccessProof) (int64, error) {
-	user, err := s.accountForProof(ctx, proof)
+	user, err := s.CurrentProfile(ctx, proof)
 	return user.ID, err
+}
+
+func lockSessionAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
+	var id int64
+	err := tx.QueryRow(ctx, `SELECT u.id FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
+ WHERE s.access_digest=$1 FOR UPDATE OF u`, digest).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, unauthorized
+	}
+	if err != nil {
+		return 0, err
+	}
+	err = tx.QueryRow(ctx, `SELECT user_id FROM auth_sessions WHERE user_id=$1 AND access_digest=$2
+ AND revoked_at IS NULL AND access_expires_at>clock_timestamp() AND expires_at>clock_timestamp() FOR SHARE`, id, digest).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, unauthorized
+	}
+	return id, err
 }

@@ -1,4 +1,4 @@
-package auth
+package account
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/ratelimit"
 )
 
@@ -15,47 +16,39 @@ type EmailSender interface {
 	Send(ctx context.Context, address, code string) error
 }
 
-func (s *Server) RequestEmailVerification(ctx context.Context, body Input, bearer string) (any, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return nil, unauthorized
+func (s *Service) RequestEmailVerification(ctx context.Context, access auth.AccessProof, address, password string) (auth.Profile, error) {
+	if err := access.Validate(); err != nil {
+		return auth.Profile{}, err
 	}
-	address := strings.TrimSpace(body.Email)
-	if address == "" || !validProfileEmail(address) || !validPassword(body.Password) {
-		return nil, invalid
+	address = strings.TrimSpace(address)
+	if address == "" || !auth.ValidProfileEmail(address) || !auth.ValidPassword(password) {
+		return auth.Profile{}, invalid
 	}
-	var id, version int64
-	var hash string
-	err := s.db.QueryRow(ctx, `SELECT u.id,u.password_version,u.password_hash FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
- WHERE s.access_digest=$1 AND s.revoked_at IS NULL AND s.access_expires_at>now() AND s.expires_at>now()`, digest).Scan(&id, &version, &hash)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return nil, unauthorized
-	}
+	snapshot, err := s.auth.PasswordSnapshot(ctx, access)
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
+	id, version := snapshot.AccountID(), snapshot.PasswordVersion()
 	if s.emailSender == nil {
-		return nil, busy
+		return auth.Profile{}, busy
 	}
 	account := strconv.FormatInt(id, 10)
 	if err := ratelimit.Allow(ctx, s.db, "email/password/"+account, 15*time.Minute, 10); err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	if err := s.acquireHash(); err != nil {
-		return nil, err
-	}
-	verified := s.passwords.verify(hash, body.Password)
-	<-s.hashSlots
-	if !verified {
-		return nil, invalid
-	}
-	code, err := newToken("em_")
+	verified, err := snapshot.Verify(password)
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
-	proof := tokenDigest(code, "em_")
+	if !verified {
+		return auth.Profile{}, invalid
+	}
+	code, proof, err := auth.NewEmailCode()
+	if err != nil {
+		return auth.Profile{}, err
+	}
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		owner, err := lockSessionAccount(ctx, tx, digest)
+		owner, err := access.LockAccount(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -65,12 +58,12 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		tag, err := tx.Exec(ctx, `INSERT INTO auth_rate_limits (key,bucket,attempts,expires_at)
  VALUES ($1,0,1,clock_timestamp()+interval '60 seconds')
  ON CONFLICT (key,bucket) DO UPDATE SET expires_at=clock_timestamp()+interval '60 seconds'
- WHERE auth_rate_limits.expires_at<=clock_timestamp()`, hexDigest("email/account/"+account))
+ WHERE auth_rate_limits.expires_at<=clock_timestamp()`, ratelimit.Key("email/account/"+account))
 		if err != nil {
 			return err
 		}
 		if tag.RowsAffected() == 0 {
-			return limited
+			return ratelimit.ErrLimited
 		}
 		for _, budget := range []struct {
 			key    string
@@ -94,14 +87,14 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		return err
 	})
 	if err != nil {
-		return nil, err
+		return auth.Profile{}, err
 	}
 	if err := s.emailSender.Send(ctx, address, code); err != nil {
-		return nil, busy
+		return auth.Profile{}, busy
 	}
-	var profile currentUser
+	var profile auth.Profile
 	err = pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		owner, err := lockSessionAccount(ctx, tx, digest)
+		owner, err := access.LockAccount(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -115,42 +108,23 @@ func (s *Server) RequestEmailVerification(ctx context.Context, body Input, beare
 		if tag.RowsAffected() != 1 {
 			return invalid
 		}
-		profile, err = scanCurrentUser(tx.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_users u WHERE u.id=$1`, id))
+		profile, err = auth.ScanProfile(tx.QueryRow(ctx, `SELECT `+auth.ProfileColumns+` FROM auth_users u WHERE u.id=$1`, id))
 		return err
 	})
 	return profile, err
 }
 
-func lockSessionAccount(ctx context.Context, tx pgx.Tx, digest []byte) (int64, error) {
-	var id int64
-	err := tx.QueryRow(ctx, `SELECT u.id FROM auth_users u JOIN auth_sessions s ON s.user_id=u.id
- WHERE s.access_digest=$1 FOR UPDATE OF u`, digest).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, unauthorized
+func (s *Service) VerifyEmail(ctx context.Context, access auth.AccessProof, code string) (auth.Profile, error) {
+	if err := access.Validate(); err != nil {
+		return auth.Profile{}, err
 	}
-	if err != nil {
-		return 0, err
-	}
-	err = tx.QueryRow(ctx, `SELECT user_id FROM auth_sessions WHERE user_id=$1 AND access_digest=$2
- AND revoked_at IS NULL AND access_expires_at>clock_timestamp() AND expires_at>clock_timestamp() FOR SHARE`, id, digest).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, unauthorized
-	}
-	return id, err
-}
-
-func (s *Server) VerifyEmail(ctx context.Context, body Input, bearer string) (any, error) {
-	digest := tokenDigest(bearer, "at_")
-	if digest == nil {
-		return nil, unauthorized
-	}
-	proof := tokenDigest(strings.TrimSpace(body.Code), "em_")
+	proof := auth.EmailCodeDigest(strings.TrimSpace(code))
 	if proof == nil {
-		return nil, invalidCode
+		return auth.Profile{}, invalidCode
 	}
-	var profile currentUser
+	var profile auth.Profile
 	err := pgx.BeginFunc(ctx, s.db, func(tx pgx.Tx) error {
-		id, err := lockSessionAccount(ctx, tx, digest)
+		id, err := access.LockAccount(ctx, tx)
 		if err != nil {
 			return err
 		}
@@ -164,7 +138,7 @@ func (s *Server) VerifyEmail(ctx context.Context, body Input, bearer string) (an
 		if err != nil {
 			return err
 		}
-		profile, err = scanCurrentUser(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+currentUserColumns, id, address))
+		profile, err = auth.ScanProfile(tx.QueryRow(ctx, `UPDATE auth_users u SET email=$2,email_verified_at=clock_timestamp() WHERE id=$1 RETURNING `+auth.ProfileColumns, id, address))
 		return err
 	})
 	return profile, err
