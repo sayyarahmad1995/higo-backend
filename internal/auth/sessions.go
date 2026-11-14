@@ -46,7 +46,7 @@ func issueSession(ctx context.Context, tx pgx.Tx, user int64) (sessionTokens, er
 
 func (s *Server) Login(ctx context.Context, body Input, _ string) (any, error) {
 	phone := phoneNumber(body.Phone)
-	if phone == "" || !validPassword(body.Password) {
+	if phone == "" || !ValidPassword(body.Password) {
 		return nil, denied
 	}
 	if err := ratelimit.Allow(ctx, s.db, "login/phone/"+phone, 15*time.Minute, 10); err != nil {
@@ -147,7 +147,7 @@ func (s *Server) Logout(ctx context.Context, _ Input, bearer string) (any, error
 	return nil, err
 }
 
-type currentUser struct {
+type Profile struct {
 	ID            int64    `json:"id"`
 	Phone         string   `json:"phone"`
 	Name          string   `json:"name"`
@@ -157,36 +157,28 @@ type currentUser struct {
 	Capabilities  []string `json:"capabilities"`
 }
 
-func (s *Server) Me(ctx context.Context, _ Input, bearer string) (any, error) {
-	return s.currentAccount(ctx, bearer)
-}
-
-func (s *Server) currentAccount(ctx context.Context, bearer string) (currentUser, error) {
-	return s.accountForProof(ctx, NewAccessProof(bearer))
-}
-
-func (s *Server) accountForProof(ctx context.Context, proof AccessProof) (currentUser, error) {
+func (s *Server) CurrentProfile(ctx context.Context, proof AccessProof) (Profile, error) {
 	if err := proof.Validate(); err != nil {
-		return currentUser{}, err
+		return Profile{}, err
 	}
-	return scanCurrentUser(s.db.QueryRow(ctx, `SELECT `+currentUserColumns+` FROM auth_sessions s
+	return ScanProfile(s.db.QueryRow(ctx, `SELECT `+ProfileColumns+` FROM auth_sessions s
  JOIN auth_users u ON u.id=s.user_id WHERE s.access_digest=$1 AND s.revoked_at IS NULL
  AND s.access_expires_at>now() AND s.expires_at>now()`, proof.digest))
 }
 
-const currentUserColumns = `u.id,u.phone,u.name,u.email,u.has_driver_capability,u.email_verified_at IS NOT NULL,
+const ProfileColumns = `u.id,u.phone,u.name,u.email,u.has_driver_capability,u.email_verified_at IS NOT NULL,
  COALESCE((SELECT c.target_email FROM auth_email_challenges c WHERE c.user_id=u.id
  AND c.original_email=u.email AND c.password_version=u.password_version AND c.delivered AND c.expires_at>clock_timestamp()),'')`
 
-func scanCurrentUser(row pgx.Row) (currentUser, error) {
-	user := currentUser{Capabilities: []string{"rider"}}
+func ScanProfile(row pgx.Row) (Profile, error) {
+	user := Profile{Capabilities: []string{"rider"}}
 	var driver bool
 	err := row.Scan(&user.ID, &user.Phone, &user.Name, &user.Email, &driver, &user.EmailVerified, &user.PendingEmail)
 	if driver {
 		user.Capabilities = append(user.Capabilities, "driver")
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return currentUser{}, unauthorized
+		return Profile{}, unauthorized
 	}
 	return user, err
 }

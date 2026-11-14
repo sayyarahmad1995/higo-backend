@@ -11,7 +11,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/sayyarahmad1995/higo-backend/internal/auth"
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 )
 
 type localEmail struct{}
@@ -26,7 +26,7 @@ type resendEmail struct {
 	client    *http.Client
 }
 
-func productionEmail() (auth.EmailSender, error) {
+func productionEmail() (account.EmailSender, error) {
 	key, from := os.Getenv("RESEND_API_KEY"), os.Getenv("HIGO_EMAIL_FROM")
 	if key == "" && from == "" {
 		return nil, nil

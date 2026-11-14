@@ -14,11 +14,11 @@ This document defines the current backend architecture. [PRODUCT.md](PRODUCT.md)
 
 ## Core process lifecycle
 
-`cmd/api` starts `internal/app` and reports terminal failures. The app package loads environment configuration, selects delivery providers, configures the PostgreSQL pool, applies existing migrations, and constructs Auth and Driver. It wires Driver retention into the existing Auth cleanup worker and builds the standard-library router in `internal/httpapi` and gives it to `internal/httpserver`, which owns listener settings and graceful shutdown. The app handles process signals and closes Auth workers before closing the database pool.
+`cmd/api` starts `internal/app` and reports terminal failures. The app package loads environment configuration, selects delivery providers, configures the PostgreSQL pool, applies existing migrations, and constructs Auth, Account, and Driver. It wires Account email-challenge expiry and Driver retention into the existing Auth cleanup worker and builds the standard-library router in `internal/httpapi` and gives it to `internal/httpserver`, which owns listener settings and graceful shutdown. The app handles process signals and closes Auth workers before closing the database pool.
 
 ## HTTP transport
 
-`internal/httpapi` registers routes and methods, decodes bounded requests, sets request deadlines, and encodes responses and error statuses. It calls concrete Auth and Driver operations. Auth interprets access credentials and revalidates the live session inside Driver transactions. Driver owns draft and evidence state, encryption, upload and preview admission, and retention. Account operations remain in Auth. Auth and Driver use the same PostgreSQL fixed-window counter with feature-owned budgets.
+`internal/httpapi` registers routes and methods, decodes bounded requests, sets request deadlines, and encodes responses and error statuses. It calls concrete Auth, Account, and Driver operations. Auth interprets access credentials and revalidates the live session inside Driver transactions. Driver owns draft and evidence state, encryption, upload and preview admission, and retention. Account owns profile edits, email verification, and email-challenge expiry. Auth provides the live profile read, transactional session guards, and shared password verification capacity. Auth, Account, and Driver use the same PostgreSQL fixed-window counter with feature-owned budgets.
 
 ## Engineering contract
 

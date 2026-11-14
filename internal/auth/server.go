@@ -28,13 +28,12 @@ type SMS interface {
 
 type Config struct {
 	PurgeDriverDocuments           func(context.Context)
-	EmailSender                    EmailSender
+	PurgeAccountEmailChallenges    func(context.Context)
 	OTPKey                         []byte
 	PasswordMemory, PasswordPasses uint32
 }
 
 type Server struct {
-	emailSender     EmailSender
 	db              *pgxpool.Pool
 	sms             SMS
 	passwords       passwords
@@ -63,10 +62,11 @@ func New(ctx context.Context, db *pgxpool.Pool, sms SMS, cfg Config) (*Server, e
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(ctx)
-	s := &Server{db: db, sms: sms, emailSender: cfg.EmailSender, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
+	s := &Server{db: db, sms: sms, passwords: p, otpKey: append([]byte(nil), cfg.OTPKey...), dummyHash: dummy,
 		hashSlots: make(chan struct{}, 2), deliveryContext: ctx, smsSlots: make(chan struct{}, 32), cancel: cancel}
+	purgeAccountEmailChallenges := cfg.PurgeAccountEmailChallenges
 	purgeDriverDocuments := cfg.PurgeDriverDocuments
-	s.worker.Go(func() { s.cleanup(ctx, purgeDriverDocuments) })
+	s.worker.Go(func() { s.cleanup(ctx, purgeAccountEmailChallenges, purgeDriverDocuments) })
 	return s, nil
 }
 
@@ -91,14 +91,14 @@ func (s *Server) dispatchSMS(item delivery) {
 	})
 }
 
-func (s *Server) cleanup(ctx context.Context, purgeDriverDocuments func(context.Context)) {
+func (s *Server) cleanup(ctx context.Context, purgeAccountEmailChallenges, purgeDriverDocuments func(context.Context)) {
 	ticker := time.NewTicker(time.Hour)
 	defer ticker.Stop()
 	for {
-		s.cleanupStatements(ctx,
-			`DELETE FROM auth_challenges WHERE expires_at<=now()`,
-			`DELETE FROM auth_email_challenges WHERE expires_at<=now()`,
-		)
+		s.cleanupStatements(ctx, `DELETE FROM auth_challenges WHERE expires_at<=now()`)
+		if purgeAccountEmailChallenges != nil {
+			purgeAccountEmailChallenges(ctx)
+		}
 		if purgeDriverDocuments != nil {
 			purgeDriverDocuments(ctx)
 		}
@@ -128,15 +128,14 @@ func (s *Server) cleanupStatements(ctx context.Context, statements ...string) {
 
 // Input carries decoded values to the feature operations.
 type Input struct {
-	Phone     string       `json:"phone"`
-	Password  string       `json:"password"`
-	Name      string       `json:"name"`
-	Email     string       `json:"email"`
-	Challenge string       `json:"challenge"`
-	Code      string       `json:"code"`
-	Refresh   string       `json:"refresh_token"`
-	Recovery  string       `json:"recovery_token"`
-	Profile   profilePatch `json:"-"`
+	Phone     string `json:"phone"`
+	Password  string `json:"password"`
+	Name      string `json:"name"`
+	Email     string `json:"email"`
+	Challenge string `json:"challenge"`
+	Code      string `json:"code"`
+	Refresh   string `json:"refresh_token"`
+	Recovery  string `json:"recovery_token"`
 }
 
 // ErrorCode identifies domain errors safe to expose in an API response.

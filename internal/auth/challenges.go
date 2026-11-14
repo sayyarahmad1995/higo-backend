@@ -23,7 +23,7 @@ func (s *Server) Register(ctx context.Context, body Input, _ string) (any, error
 	phone := phoneNumber(body.Phone)
 	name := strings.TrimSpace(body.Name)
 	email := strings.TrimSpace(body.Email)
-	if phone == "" || !validPassword(body.Password) || !validProfileName(name) || !validProfileEmail(email) {
+	if phone == "" || !ValidPassword(body.Password) || !ValidProfileName(name) || !ValidProfileEmail(email) {
 		return nil, invalid
 	}
 	return s.issue(ctx, registration, phone, body.Password, name, email)
@@ -169,7 +169,7 @@ func (s *Server) Reset(ctx context.Context, body Input, _ string) (any, error) {
 	if digest == nil {
 		return nil, invalidRecovery
 	}
-	if !validPassword(body.Password) {
+	if !ValidPassword(body.Password) {
 		return nil, invalid
 	}
 	var user, version int64

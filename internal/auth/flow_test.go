@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/driver"
 	"github.com/sayyarahmad1995/higo-backend/internal/httpapi"
@@ -85,16 +86,17 @@ func TestAuthenticationFlow(t *testing.T) {
 	}
 	sms := &testSMS{codes: make(chan string, 4), started: make(chan struct{})}
 	emails := make(testEmail, 4)
+	emailSender := &gatedEmail{testEmail: emails}
 	driverService, err := driver.New(isolated, bytes.Repeat([]byte{8}, 32))
 	if err != nil {
 		t.Fatal(err)
 	}
-	server, err := auth.New(ctx, isolated, sms, auth.Config{PurgeDriverDocuments: driverService.PurgeDocuments, EmailSender: emails, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
+	server, err := auth.New(ctx, isolated, sms, auth.Config{PurgeDriverDocuments: driverService.PurgeDocuments, PurgeAccountEmailChallenges: func(ctx context.Context) { account.PurgeExpiredEmailChallenges(ctx, isolated) }, OTPKey: bytes.Repeat([]byte{7}, 32), PasswordMemory: 19456, PasswordPasses: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer server.Close()
-	handler := httpapi.Handler(server, driverService)
+	handler := httpapi.Handler(server, account.New(isolated, server, emailSender), driverService)
 	peer := "192.0.2.1:12345"
 	call := func(method, path, bearer string, body any) (int, map[string]any) {
 		data, _ := json.Marshal(body)
@@ -431,6 +433,9 @@ func TestAuthenticationFlow(t *testing.T) {
 		status, body = patch(secondAccess, map[string]any{"name": "Other"})
 		expect(t, status, 401, body)
 	})
+	t.Run("Account security boundaries", func(t *testing.T) {
+		testAccountBoundaries(t, isolated, handler, server, emailSender, phone, oldPassword)
+	})
 	t.Run("email replacement stays pending and proof is account-bound and single-use", func(t *testing.T) {
 		if len(emails) != 0 {
 			t.Fatal("registration sent verification email")
@@ -728,7 +733,7 @@ func TestAuthenticationFlow(t *testing.T) {
 }
 
 func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
-	handler := httpapi.Handler(&auth.Server{}, &driver.Service{})
+	handler := httpapi.Handler(&auth.Server{}, &account.Service{}, &driver.Service{})
 	for _, path := range []string{"/admin/", "/admin/app.mjs", "/api/v1/admin/onboarding", "/api/v1/admin/onboarding/document",
 		"/api/v1/admin/onboarding/decision", "/api/v1/admin/auth/login", "/api/v1/admin/audit", "/api/v1/me/driver-submission", "/api/v1/me/vehicles"} {
 		for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPatch} {
@@ -742,7 +747,7 @@ func TestOnboardingHasNoAdministrativeOrLegacyRoutes(t *testing.T) {
 }
 
 func TestHTTPMethods(t *testing.T) {
-	handler := httpapi.Handler(&auth.Server{}, &driver.Service{})
+	handler := httpapi.Handler(&auth.Server{}, &account.Service{}, &driver.Service{})
 	recorder := httptest.NewRecorder()
 	handler.ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/v1/auth/login", nil))
 	if recorder.Code != http.StatusMethodNotAllowed || recorder.Header().Get("Allow") != http.MethodPost {

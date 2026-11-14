@@ -29,10 +29,10 @@ func validCost(memory, passes uint32) bool {
 	return memory >= 19456 && memory <= 131072 && passes >= 2 && passes <= 4
 }
 
-func validPassword(password string) bool { return len(password) >= 12 && len(password) <= 128 }
+func ValidPassword(password string) bool { return len(password) >= 12 && len(password) <= 128 }
 
 func (p passwords) hash(password string) (string, error) {
-	if !validPassword(password) || !validCost(p.memory, p.passes) {
+	if !ValidPassword(password) || !validCost(p.memory, p.passes) {
 		return "", errors.New("invalid password or Argon2id parameters")
 	}
 	salt := make([]byte, 16)

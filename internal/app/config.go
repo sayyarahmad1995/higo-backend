@@ -9,12 +9,14 @@ import (
 	"os"
 	"strconv"
 
+	"github.com/sayyarahmad1995/higo-backend/internal/account"
 	"github.com/sayyarahmad1995/higo-backend/internal/auth"
 	"github.com/sayyarahmad1995/higo-backend/internal/sms"
 )
 
 type config struct {
 	auth                 auth.Config
+	emailSender          account.EmailSender
 	driverDocumentKey    []byte
 	address, databaseURL string
 	sms                  auth.SMS
@@ -63,9 +65,9 @@ func loadConfig() (config, error) {
 			return cfg, errors.New("development SMS requires a loopback listener")
 		}
 		cfg.sms = localSMS{}
-		cfg.auth.EmailSender = localEmail{}
+		cfg.emailSender = localEmail{}
 	case "production":
-		cfg.auth.EmailSender, err = productionEmail()
+		cfg.emailSender, err = productionEmail()
 		if err != nil {
 			return cfg, err
 		}
